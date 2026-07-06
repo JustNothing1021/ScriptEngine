@@ -1,0 +1,50 @@
+plugins {
+    id 'java-library'
+    id 'application'
+}
+
+repositories {
+    mavenCentral()
+}
+
+application {
+    mainClass = 'com.justnothing.engine.repl.EvalRepl'
+}
+
+run {
+    standardInput = System.in
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+dependencies {
+    implementation 'org.jetbrains:annotations:26.1.0'
+    implementation 'org.ow2.asm:asm:9.9.1'
+    implementation 'org.ow2.asm:asm-tree:9.9.1'
+    testImplementation 'junit:junit:4.13.2'
+}
+
+sourceSets {
+    main {
+        java {
+            srcDirs = ['src/main/java']
+        }
+    }
+    test {
+        java {
+            srcDirs = ['src/test/java']
+        }
+    }
+}
+
+test {
+    jvmArgs += [
+        '--add-opens', 'java.base/java.util.stream=ALL-UNNAMED',
+        '--add-opens', 'java.base/java.lang=ALL-UNNAMED',
+        '--add-opens', 'java.base/java.lang.reflect=ALL-UNNAMED',
+        '--add-opens', 'java.base/java.util=ALL-UNNAMED'
+    ]
+}

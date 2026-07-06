@@ -1,0 +1,47 @@
+# 一些配置文件和缓存目录
+*.iml
+.gradle
+/local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/build
+/app/build
+/engine/build
+/engine_new/build
+/engine_v2/build
+/captures
+.externalNativeBuild
+.cxx
+local.properties
+/.vscode
+
+gradle/wrapper/dists/
+
+# VSCode 生成的bin文件
+/bin
+
+# 我拿来研究的log
+/tmp.log
+/logs
+/report
+
+# 有的时候我会让AI写一些MD
+/*.md
+
+# 但是Readme还是要提交的
+!/README.MD
+
+# 中文版也是
+!/README_CN.md
+
+# 还有一些神秘的日志文件
+*.log
+
+
+
+
