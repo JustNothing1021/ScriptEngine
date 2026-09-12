@@ -18,20 +18,31 @@ public class ClassResolver {
     private static ClassLoader primaryClassLoader = null;
     private static final Object loaderLock = new Object();
     private static final Map<String, Object> classCache = new ConcurrentHashMap<>();
+    /**
+     * 带 import 解析的独立缓存。
+     * <p>直接查找（findClass）失败的黑名单不应阻断 import 解析：简单名（如 String）
+     * 直接查找必然失败，但可通过 java.lang.* 等通配符 import 找到。若两者共用
+     * 同一黑名单，resolveClass 先 findClass 后 findClassWithImports 的顺序会导致
+     * findClass 先写入 NOT_FOUND，findClassWithImports 直接命中黑名单而永远无法
+     * 通过 import 解析。因此这里使用独立的缓存，避免两类查找互相污染。
+     */
+    private static final Map<String, Object> importClassCache = new ConcurrentHashMap<>();
     /** 哨兵对象，标记"已查找但不存在"的类（黑名单） */
     private static final Object NOT_FOUND = new Object();
 
     public static void clearClassCache() {
         classCache.clear();
+        importClassCache.clear();
     }
 
     /** 仅清空黑名单（找不到的类的缓存），保留已找到的类的缓存 */
     public static void clearBlacklist() {
         classCache.entrySet().removeIf(e -> e.getValue() == NOT_FOUND);
+        importClassCache.entrySet().removeIf(e -> e.getValue() == NOT_FOUND);
     }
 
     public static int getCacheSize() {
-        return classCache.size();
+        return classCache.size() + importClassCache.size();
     }
 
     public static void registerClassLoader(ClassLoader loader) {
@@ -140,14 +151,14 @@ public class ClassResolver {
     }
 
     public static Class<?> findClassWithImports(String className, ClassLoader classLoader, List<String> imports) {
-        Object cached = classCache.get(className);
+        Object cached = importClassCache.get(className);
         if (cached != null) return cached == NOT_FOUND ? null : (Class<?>) cached;
 
         Class<?> result = findClassWithImportsInternal(className, classLoader, imports);
         if (result != null) {
-            classCache.put(className, result);
+            importClassCache.put(className, result);
         } else {
-            classCache.put(className, NOT_FOUND);
+            importClassCache.put(className, NOT_FOUND);
         }
         return result;
     }

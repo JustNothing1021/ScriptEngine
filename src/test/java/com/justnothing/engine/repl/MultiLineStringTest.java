@@ -28,6 +28,7 @@ public class MultiLineStringTest {
         runner = new ScriptRunner();
         runner.addImport("java.util.*");
         runner.addImport("java.lang.*");
+        runner.setReplMode(true);  // 测试跨 execute 保留变量/import（与 REPL 一致）
     }
 
  

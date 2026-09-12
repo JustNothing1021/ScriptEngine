@@ -18,6 +18,7 @@ public class MiniAppFullTest {
     public void setUp() {
         runner = new ScriptRunner();
         runner.setStrictMode(false);  // 旧版 raw class 代码兼容
+        runner.setReplMode(true);  // 测试跨 execute 保留函数/类声明（与 REPL 一致）
     }
 
     // ========== Baseline ==========

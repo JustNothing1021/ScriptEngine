@@ -132,7 +132,7 @@ public class TypeParser extends BaseParser {
 
         // 严格模式：未知类型必须报错（不允许前向引用）
         if (resolvedClass == null && context.isStrictMode()) {
-            throw error("Unknown type '" + fullTypeName + "' — "
+            throw error("Unknown type '" + fullTypeName + "'; "
                     + "cannot resolve class (forward references are not allowed)",
                     ErrorCode.PARSE_CLASS_NOT_FOUND);
         }

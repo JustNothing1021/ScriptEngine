@@ -43,6 +43,25 @@ public class ScriptRunner {
     private final OperatorRegistry operatorRegistry;
     private boolean enablePreprocessor = true;
 
+    /**
+     * REPL 模式开关。
+     * <p>默认 false：每次 executeWithResult / executeNodes 前都会 resetParseContext，
+     * 保证多次执行互相隔离（脚本模式语义）。
+     * <br>设为 true 时保留同一个 ParseContext，import / 变量 / 类声明可跨行生效，
+     * 供 sinteractive 等交互式 REPL 使用（与 EvalRepl 复用 ParseContext 的行为一致）。
+     */
+    private boolean replMode = false;
+
+    /** 是否处于 REPL 模式（保留 ParseContext 状态）。 */
+    public boolean isReplMode() {
+        return replMode;
+    }
+
+    /** 开启/关闭 REPL 模式。开启后多次执行之间保留 import / 变量 / 类声明。 */
+    public void setReplMode(boolean replMode) {
+        this.replMode = replMode;
+    }
+
     public ScriptRunner() {
         this(Thread.currentThread().getContextClassLoader());
     }
@@ -125,7 +144,9 @@ public class ScriptRunner {
 
     public Object executeWithResult(String code, String sourceFileName) {
         try {
-            resetParseContext();
+            if (!replMode) {
+                resetParseContext();
+            }
             String processedCode = preprocess(code);
             Lexer lexer = new Lexer(processedCode, sourceFileName);
             Parser parser = new Parser(lexer.tokenize(), parseContext, sourceFileName);
@@ -211,7 +232,9 @@ public class ScriptRunner {
             this.errorHandler = err != null ? err : oldErr;
             if (out != null) evalContext.setOutput(out);
 
-            resetParseContext();
+            if (!replMode) {
+                resetParseContext();
+            }
 
             for (ASTNode node : nodes) {
                 if (node instanceof ClassDeclarationNode classDecl) {

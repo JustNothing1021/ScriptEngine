@@ -35,6 +35,7 @@ public class OperatorSystemIntegrationTest {
         runner = new ScriptRunner();
         runner.addImport("java.util.*");
         runner.setStrictMode(false);
+        runner.setReplMode(true);  // 测试跨 execute 保留变量/import/类声明（与 REPL 一致）
     }
 
     @After

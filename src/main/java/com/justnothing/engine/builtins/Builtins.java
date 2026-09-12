@@ -667,7 +667,7 @@ public class Builtins {
                 Object raw = args.get(0).asJavaObject();
                 value = raw instanceof Boolean b ? b : Boolean.parseBoolean(raw.toString());
             }
-            output().println("setPrintAST(" + value + ") — AST 打印模式已切换（此版本中不影响行为）");
+            output().println("setPrintAST(" + value + "); AST 打印模式已切换（此版本中不影响行为）");
             return wrap(value);
         });
 
