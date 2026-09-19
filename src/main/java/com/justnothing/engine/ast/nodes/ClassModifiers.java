@@ -14,6 +14,11 @@ public class ClassModifiers {
     private boolean isAbstract = false;
     private boolean isNative = false;
     private boolean isSynchronized = false;
+    private boolean isVolatile = false;
+    private boolean isTransient = false;
+    private boolean isStrictfp = false;
+    private boolean isSealed = false;
+    private boolean isNonSealed = false;
     
     public ClassModifiers() {
         // 不做操作
@@ -42,6 +47,21 @@ public class ClassModifiers {
     
     public boolean isSynchronized() { return isSynchronized; }
     public void setSynchronized(boolean isSynchronized) { this.isSynchronized = isSynchronized; }
+
+    public boolean isVolatile() { return isVolatile; }
+    public void setVolatile(boolean isVolatile) { this.isVolatile = isVolatile; }
+
+    public boolean isTransient() { return isTransient; }
+    public void setTransient(boolean isTransient) { this.isTransient = isTransient; }
+
+    public boolean isStrictfp() { return isStrictfp; }
+    public void setStrictfp(boolean isStrictfp) { this.isStrictfp = isStrictfp; }
+
+    public boolean isSealed() { return isSealed; }
+    public void setSealed(boolean isSealed) { this.isSealed = isSealed; }
+
+    public boolean isNonSealed() { return isNonSealed; }
+    public void setNonSealed(boolean isNonSealed) { this.isNonSealed = isNonSealed; }
     
     public String toModifierString() {
         List<String> mods = new ArrayList<>();
@@ -51,8 +71,13 @@ public class ClassModifiers {
         if (isStatic) mods.add("static");
         if (isFinal) mods.add("final");
         if (isAbstract) mods.add("abstract");
+        if (isSealed) mods.add("sealed");
+        if (isNonSealed) mods.add("non-sealed");
         if (isNative) mods.add("native");
         if (isSynchronized) mods.add("synchronized");
+        if (isVolatile) mods.add("volatile");
+        if (isTransient) mods.add("transient");
+        if (isStrictfp) mods.add("strictfp");
         return String.join(" ", mods);
     }
     
@@ -64,8 +89,11 @@ public class ClassModifiers {
         if (isStatic) flags |= 0x0008;
         if (isFinal) flags |= 0x0010;
         if (isSynchronized) flags |= 0x0020;
+        if (isVolatile) flags |= 0x0040;
+        if (isTransient) flags |= 0x0080;
         if (isNative) flags |= 0x0100;
         if (isAbstract) flags |= 0x0400;
+        if (isStrictfp) flags |= 0x0800;
         return flags;
     }
     

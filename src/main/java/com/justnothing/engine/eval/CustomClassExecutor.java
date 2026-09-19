@@ -2,6 +2,7 @@ package com.justnothing.engine.eval;
 
 import com.justnothing.engine.ast.ASTNode;
 import com.justnothing.engine.ast.nodes.*;
+import com.justnothing.engine.codegen.DynamicClassGenerator;
 import com.justnothing.engine.exception.ReturnException;
 import com.justnothing.engine.parser.ParseContext;
 
@@ -15,18 +16,35 @@ public class CustomClassExecutor {
     private static final Map<String, MethodDeclarationNode> methodRegistry = new ConcurrentHashMap<>();
     private static final ThreadLocal<ExecutorContext> currentContext = new ThreadLocal<>();
 
+    /** 正在执行的脚本类方法帧，用于嵌套调用返回后刷新外层的字段镜像。 */
+    private static final ThreadLocal<Deque<ActiveFrame>> activeFrames =
+            ThreadLocal.withInitial(ArrayDeque::new);
+
     public static void setContext(EvalContext evalCtx, ParseContext parseCtx) {
         currentContext.set(new ExecutorContext(evalCtx, parseCtx));
     }
 
     public static void clearContext() {
         currentContext.remove();
+        activeFrames.remove();
     }
 
     private static ExecutorContext requireContext() {
         ExecutorContext ctx = currentContext.get();
         if (ctx == null) throw new IllegalStateException("CustomClassExecutor not initialized");
         return ctx;
+    }
+
+    /**
+     * 字段镜像变量在方法帧里的名字。
+     * <p>
+     * 必须与字段名本身区分开：方法内可能有同名形参或局部变量遮蔽字段
+     * （{@code void set(int v) { this.v = v; }} 就是最常见的一种），若镜像直接用字段名，
+     * 两者会互相覆盖，导致 {@code v} 读到字段旧值、局部变量赋值又误写进字段。
+     * </p>
+     */
+    public static String mirrorName(String fieldName) {
+        return "$field$" + fieldName;
     }
 
     public static void registerMethod(String className, String methodName, String descriptor,
@@ -69,6 +87,13 @@ public class CustomClassExecutor {
         // this
         if (instance != null) {
             methodCtx.declareVariable("this", Value.of(instance));
+        } else {
+            // 静态方法：脚本内未限定的同类调用 f(...) 会被解析为 this.f(...)，
+            // 此处把 this 绑定到类对象，使静态方法能以类为接收者正确分发
+            Class<?> self = resolveGeneratedClass(ctx.parseContext, className);
+            if (self != null) {
+                methodCtx.declareVariable("this", Value.of(self));
+            }
         }
 
         // 参数
@@ -79,46 +104,59 @@ public class CustomClassExecutor {
             }
         }
 
-        // 读取实例字段 → 设置变量
+        // 读取实例字段 → 设置同名镜像变量：方法体内的字段读写都走镜像，
+        // 赋值由 Evaluator 立即写穿回实例字段（见 Evaluator#writeFieldThroughMirror），
+        // 因此这里不再做方法结束时的统一写回 —— 那种「延迟写回」会让本方法内随后
+        // 发起的嵌套调用读到字段旧值，也会用陈旧镜像覆盖嵌套调用对同一字段的修改
         Map<String, Field> fields = collectFields(instance != null ? instance.getClass() : null);
         for (Field f : fields.values()) {
             try {
-                methodCtx.declareVariable(f.getName(), Value.of(f.get(instance)));
+                methodCtx.declareVariable(mirrorName(f.getName()), Value.of(f.get(instance)));
             } catch (Exception ignored) {
             }
         }
 
         // 执行方法体
         Evaluator methodEval = new Evaluator(methodCtx, ctx.parseContext);
+        activeFrames.get().push(new ActiveFrame(instance, fields, methodCtx));
         Value result;
         try {
             result = methodEval.evaluate(body);
         } catch (ReturnException e) {
-            // 字段写回
-            for (Field f : fields.values()) {
-                try {
-                    if (methodCtx.hasVariable(f.getName())) {
-                        Value v = methodCtx.getVariable(f.getName());
-                        f.set(instance, v.asJavaObject());
-                    }
-                } catch (Exception ignored) {
-                }
-            }
             return ((Value) e.getValue()).asJavaObject();
-        }
-
-        // 字段写回
-        for (Field f : fields.values()) {
-            try {
-                if (methodCtx.hasVariable(f.getName())) {
-                    Value v = methodCtx.getVariable(f.getName());
-                    f.set(instance, v.asJavaObject());
-                }
-            } catch (Exception ignored) {
-            }
+        } finally {
+            activeFrames.get().pop();
+            // 嵌套调用的方法体可能改过同一实例的字段，需要把外层帧的镜像刷新为最新值
+            refreshEnclosingMirrors(instance);
         }
 
         return result != null ? result.asJavaObject() : null;
+    }
+
+    /**
+     * 把外层方法帧的字段镜像重新读成实例上的最新值。
+     * <p>
+     * 镜像只是读取用的缓存，实例字段才是唯一真相：本方法（被嵌套调用的那层）可能刚改过
+     * 字段，而外层帧手里的还是进入时的旧副本，不刷新的话外层后续读取会拿到过期值。
+     * </p>
+     */
+    private static void refreshEnclosingMirrors(Object instance) {
+        if (instance == null) {
+            return;
+        }
+        for (ActiveFrame frame : activeFrames.get()) {
+            if (frame.instance() != instance) continue;
+            for (Field f : frame.fields().values()) {
+                try {
+                    frame.methodCtx().declareVariable(mirrorName(f.getName()), Value.of(f.get(instance)));
+                } catch (Exception ignored) {
+                }
+            }
+        }
+    }
+
+    /** 一个正在执行的脚本类方法帧：绑定实例、实例字段表与该帧的字段镜像上下文。 */
+    private record ActiveFrame(Object instance, Map<String, Field> fields, EvalContext methodCtx) {
     }
 
     private static MethodDeclarationNode findMethodByParamCount(String className, String methodName, int paramCount) {
@@ -131,6 +169,13 @@ public class CustomClassExecutor {
             }
         }
         return null;
+    }
+
+    /** 查找脚本引擎生成的类（用于静态方法中把 this 绑定为类对象）。 */
+    private static Class<?> resolveGeneratedClass(ParseContext parseContext, String className) {
+        if (parseContext == null) return null;
+        DynamicClassGenerator codegen = parseContext.getCodeGenerator();
+        return codegen != null ? codegen.getGenerated(className) : null;
     }
 
     private static Map<String, Field> collectFields(Class<?> clazz) {

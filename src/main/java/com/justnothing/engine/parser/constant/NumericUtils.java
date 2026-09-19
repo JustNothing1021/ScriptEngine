@@ -38,7 +38,18 @@ final class NumericUtils {
         return doubleOp.apply(toNumber(a).doubleValue(), toNumber(b).doubleValue());
     }
 
-    static Object applyLong(Object a, Object b, LongOp op) {
+    /**
+     * 位运算折叠：两个 {@code Integer} 保持 {@code Integer}，其余按 long 提升。
+     * <p>
+     * 必须与运行时一致：{@code OperatorRegistry} 把 {@code int,int} 的位运算注册为返回
+     * {@code int}，若折叠一律提升为 {@code Long}，{@code (1 | 2) == 3} 会在解析期折叠成
+     * {@code false}、未折叠时却是 {@code true} —— 常量折叠改变语义。
+     * </p>
+     */
+    static Object applyBitwise(Object a, Object b, LongOp op) {
+        if (a instanceof Integer && b instanceof Integer) {
+            return (int) op.apply(((Number) a).longValue(), ((Number) b).longValue());
+        }
         return op.apply(toNumber(a).longValue(), toNumber(b).longValue());
     }
 

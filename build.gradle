@@ -45,6 +45,16 @@ sourceSets {
 }
 
 test {
+    // 解析器拆分探针透传（说明见 ParseContext 的"拆分探针"一节）：
+    //   -Pengine.parser.noClassResolution=true  关掉解析期类解析
+    //   -Pengine.parser.noTypeAnnotation=true   关掉解析期类型标注
+    //   -Pengine.parser.noSemanticChecks=true   关掉解析期语义校验
+    //   -Pengine.parser.probeScope=all          连运行期一起退化（对照组，默认 parse=只作用解析期）
+    ['noClassResolution', 'noTypeAnnotation', 'noSemanticChecks', 'probeScope'].each { name ->
+        if (findProperty("engine.parser.$name") != null) {
+            systemProperty "engine.parser.$name", findProperty("engine.parser.$name")
+        }
+    }
     jvmArgs += [
         '--add-opens', 'java.base/java.util.stream=ALL-UNNAMED',
         '--add-opens', 'java.base/java.lang=ALL-UNNAMED',

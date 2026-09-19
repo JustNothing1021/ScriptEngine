@@ -1,5 +1,6 @@
 package com.justnothing.engine.parser;
 
+import com.justnothing.engine.api.ClassResolver;
 import com.justnothing.engine.ast.GenericType;
 import com.justnothing.engine.exception.ErrorCode;
 import com.justnothing.engine.lexer.Token;
@@ -24,6 +25,22 @@ import java.util.List;
  * </p>
  */
 public class TypeParser extends BaseParser {
+
+    /**
+     * 是否允许未解析的类型名。
+     * <p>
+     * 默认 false：严格模式下未知类型直接报错。
+     * 置为 true 时，无法解析的类型名回退为 {@code Object.class} 而不报错 ——
+     * 类体成员声明需要它，因为字段/参数/返回值可以是类的泛型类型参数（如 {@code T value;}），
+     * 这些名字不是真实的类。
+     * </p>
+     */
+    private boolean allowUnresolvedTypes = false;
+
+    /** 设置是否允许未解析的类型名（见 {@link #allowUnresolvedTypes}）。 */
+    public void setAllowUnresolvedTypes(boolean allowUnresolvedTypes) {
+        this.allowUnresolvedTypes = allowUnresolvedTypes;
+    }
 
     /**
      * 构造器。
@@ -97,7 +114,11 @@ public class TypeParser extends BaseParser {
         // 基本类型关键字
         if (isPrimitiveTypeKeyword(peek().type())) {
             String name = advance().text();
-            Class<?> primitive = context.resolveClass(name);
+            // 基本类型是语法层就该知道的知识（ClassResolver 里有本地表），不属于"类解析"：
+            // 探针模式下仍照常解析，否则 int/long/... 会退化成 Object，污染测量结果。
+            Class<?> primitive = ParseContext.probeSkipsClassResolution()
+                    ? ClassResolver.findClass(name)
+                    : context.resolveClass(name);
             return GenericType.of(primitive != null ? primitive : Object.class);
         }
 
@@ -124,15 +145,15 @@ public class TypeParser extends BaseParser {
         List<GenericType> typeArguments = new ArrayList<>();
         if (match(TokenType.OPERATOR_LESS_THAN)) {
             typeArguments = parseTypeArguments();
-            consumeGenericClose();
+            consumeGenericClose("Expected '>' after type arguments");
         }
 
         String fullTypeName = typeName.toString();
         Class<?> resolvedClass = context.resolveClass(fullTypeName);
 
         // 严格模式：未知类型必须报错（不允许前向引用）
-        if (resolvedClass == null && context.isStrictMode()) {
-            throw error("Unknown type '" + fullTypeName + "'; "
+        if (resolvedClass == null && context.isStrictMode() && !allowUnresolvedTypes) {
+            throw semanticError("Unknown type '" + fullTypeName + "'; "
                     + "cannot resolve class (forward references are not allowed)",
                     ErrorCode.PARSE_CLASS_NOT_FOUND);
         }
@@ -202,40 +223,6 @@ public class TypeParser extends BaseParser {
     }
 
     // ==================== 辅助方法 ====================
-
-    /** 嵌套泛型闭合时，从 >> / >>> 中预取的剩余 > 数量。 */
-    private int pendingAngleBrackets = 0;
-
-    /**
-     * 消费泛型闭合符。
-     * <p>
-     * Java 允许嵌套泛型中使用 {@code >>} 代替 {@code > >}（如 {@code List<List<String>>}），
-     * 但 Lexer 会将 {@code >>} 识别为右移操作符。此处做兼容处理：
-     * 当遇到 {@code >>} 时，将多出的 {@code >} 存入 {@link #pendingAngleBrackets} 供外层使用。
-     * </p>
-     */
-    private void consumeGenericClose() throws CythavaParseException {
-        // 先消耗之前预存的
-        if (pendingAngleBrackets > 0) {
-            pendingAngleBrackets--;
-            return;
-        }
-
-        if (match(TokenType.OPERATOR_GREATER_THAN)) {
-            return; // 正常的 >
-        }
-        if (match(TokenType.OPERATOR_RIGHT_SHIFT)) {
-            // >> = 两个 >，消费一个，存一个
-            pendingAngleBrackets++;
-            return;
-        }
-        if (match(TokenType.OPERATOR_UNSIGNED_RIGHT_SHIFT)) {
-            // >>> = 三个 >，消费一个，存两个
-            pendingAngleBrackets += 2;
-            return;
-        }
-        throw error("Expected '>' after type arguments", ErrorCode.PARSE_INVALID_TYPE);
-    }
 
     /**
      * 判断当前 token 是否可以作为类型的起始 token。

@@ -20,9 +20,14 @@ import java.lang.reflect.Type;
 import java.lang.reflect.TypeVariable;
 import java.lang.reflect.ParameterizedType;
 import java.util.ArrayList;
+import java.util.ArrayDeque;
+import java.util.Arrays;
+import java.util.Deque;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 解析期方法重载选择器。
@@ -388,7 +393,7 @@ public class MethodResolver {
      */
     private List<Method> findApplicableMethods(Class<?> targetClass, String methodName,
                                                 ASTNode target, Class<?>[] argTypes) {
-        Method[] allMethods = targetClass.getMethods();
+        Method[] allMethods = ReflectCache.methods(targetClass);
         List<Method> candidates = new ArrayList<>(4);
 
         for (Method m : allMethods) {
@@ -615,7 +620,7 @@ public class MethodResolver {
         Boolean cached = fiCache.get(clazz);
         if (cached != null) return cached;
         int count = 0;
-        for (Method m : clazz.getMethods()) {
+        for (Method m : ReflectCache.methods(clazz)) {
             if (m.getDeclaringClass() == Object.class) continue;
             if (Modifier.isAbstract(m.getModifiers()) && !m.isDefault()) {
                 count++;
@@ -632,7 +637,7 @@ public class MethodResolver {
      */
     public static Method getSAM(Class<?> fiClass) {
         if (fiClass == null || !fiClass.isInterface()) return null;
-        for (Method m : fiClass.getMethods()) {
+        for (Method m : ReflectCache.methods(fiClass)) {
             if (m.getDeclaringClass() == Object.class) continue;
             if (Modifier.isAbstract(m.getModifiers()) && !m.isDefault()) {
                 return m;
@@ -757,7 +762,7 @@ public class MethodResolver {
         Method bestMatch = null;
         int bestScore = Integer.MAX_VALUE;
 
-        for (Method m : clazz.getMethods()) {
+        for (Method m : ReflectCache.methods(clazz)) {
             if (!m.getName().equals(methodName)) continue;
             if (!isApplicable(m, argTypes)) continue;
 
@@ -780,6 +785,67 @@ public class MethodResolver {
         }
         sb.append("]");
         throw new IllegalArgumentException(sb.toString());
+    }
+
+    /**
+     * 返回可安全 {@code invoke} 的方法句柄。
+     * <p>
+     * JDK 会把一些公开方法的实现类声明为非公开类型，例如 {@code List.of(1, 2).size()}
+     * 实际绑定到 {@code java.util.ImmutableCollections$List12#size()}：方法本身是 public，
+     * 但声明类不可访问，直接 invoke 会抛 {@code IllegalAccessException}。
+     * 此处若声明类不可访问，就沿父类/接口找到同名同签名的公开声明改用它
+     * （如 {@code java.util.List#size()}）。
+     * </p>
+     */
+    public static Method accessible(Method method) {
+        if (method == null || isClassAccessible(method.getDeclaringClass())) {
+            return method;
+        }
+        Method rehosted = findAccessibleDeclaration(method);
+        return rehosted != null ? rehosted : method;
+    }
+
+    /** 类及其所有外层类都是 public（嵌套在非公开类中的 public 类同样不可访问）。 */
+    private static boolean isClassAccessible(Class<?> clazz) {
+        for (Class<?> c = clazz; c != null; c = c.getEnclosingClass()) {
+            if (!Modifier.isPublic(c.getModifiers())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** 在父类与接口中查找同名同签名的可访问声明。 */
+    private static Method findAccessibleDeclaration(Method method) {
+        Deque<Class<?>> queue = new ArrayDeque<>();
+        Set<Class<?>> visited = new HashSet<>();
+        Class<?> start = method.getDeclaringClass();
+        if (start.getSuperclass() != null) {
+            queue.add(start.getSuperclass());
+        }
+        queue.addAll(Arrays.asList(start.getInterfaces()));
+
+        while (!queue.isEmpty()) {
+            Class<?> current = queue.poll();
+            if (!visited.add(current)) {
+                continue;
+            }
+            if (isClassAccessible(current)) {
+                try {
+                    Method candidate = current.getMethod(method.getName(), method.getParameterTypes());
+                    if (isClassAccessible(candidate.getDeclaringClass())) {
+                        return candidate;
+                    }
+                } catch (NoSuchMethodException ignored) {
+                    // 该方法未在此层声明，继续向上查找
+                }
+            }
+            if (current.getSuperclass() != null) {
+                queue.add(current.getSuperclass());
+            }
+            queue.addAll(Arrays.asList(current.getInterfaces()));
+        }
+        return null;
     }
 
     /** 运行时方法匹配分数（varargs 惩罚） */
@@ -913,6 +979,17 @@ public class MethodResolver {
             return (T) value;
         }
         if (targetType.isPrimitive()) {
+            // Character 不是 Number，必须在强转前单独处理（char ↔ 数值的装箱/拆箱）
+            if (value instanceof Character ch) {
+                if (targetType == char.class) return (T) ch;
+                int ci = ch.charValue();
+                if (targetType == int.class) return (T) (Integer) ci;
+                if (targetType == long.class) return (T) (Long) (long) ci;
+                if (targetType == double.class) return (T) (Double) (double) ci;
+                if (targetType == float.class) return (T) (Float) (float) ci;
+                if (targetType == short.class) return (T) (Short) (short) ci;
+                if (targetType == byte.class) return (T) (Byte) (byte) ci;
+            }
             Number n = (Number) value;
             if (targetType == int.class) return (T) (Integer) n.intValue();
             if (targetType == long.class) return (T) (Long) n.longValue();
@@ -920,7 +997,7 @@ public class MethodResolver {
             if (targetType == float.class) return (T) (Float) n.floatValue();
             if (targetType == short.class) return (T) (Short) n.shortValue();
             if (targetType == byte.class) return (T) (Byte) n.byteValue();
-            if (targetType == char.class) return (T) (Character) (char) ((Number) value).intValue();
+            if (targetType == char.class) return (T) (Character) (char) n.intValue();
         }
         return (T) value;
     }

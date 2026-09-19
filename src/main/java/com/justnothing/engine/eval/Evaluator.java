@@ -2,6 +2,7 @@ package com.justnothing.engine.eval;
 
 import com.justnothing.engine.ast.ASTNode;
 import com.justnothing.engine.ast.GenericType;
+import com.justnothing.engine.ast.NameRef;
 import com.justnothing.engine.ast.OperatorCallback;
 import com.justnothing.engine.ast.nodes.*;
 import com.justnothing.engine.ast.visitor.ASTVisitor;
@@ -14,7 +15,9 @@ import com.justnothing.engine.exception.ErrorCode;
 import com.justnothing.engine.exception.EvalException;
 import com.justnothing.engine.exception.LabeledBreakException;
 import com.justnothing.engine.exception.ReturnException;
+import com.justnothing.engine.exception.YieldException;
 import com.justnothing.engine.util.MethodResolver;
+import com.justnothing.engine.util.ReflectCache;
 import com.justnothing.engine.parser.JType;
 import com.justnothing.engine.parser.OperatorRegistry;
 import com.justnothing.engine.parser.ParseContext;
@@ -73,6 +76,7 @@ public class Evaluator implements ASTVisitor<Value> {
     public Value visit(ASTNode node) {
         if (node instanceof LiteralNode n) return visitLiteral(n);
         if (node instanceof VariableNode n) return visitVariable(n);
+        if (node instanceof NameRefNode n) return visitNameRef(n);
         if (node instanceof BinaryOpNode n) return visitBinaryOp(n);
         if (node instanceof UnaryOpNode n) return visitUnaryOp(n);
         if (node instanceof AssignmentNode n) return visitAssignment(n);
@@ -95,6 +99,7 @@ public class Evaluator implements ASTVisitor<Value> {
         if (node instanceof ForEachNode n) return visitForEach(n);
         if (node instanceof SwitchNode n) return visitSwitch(n);
         if (node instanceof ReturnNode n) return visitReturn(n);
+        if (node instanceof YieldNode n) return visitYield(n);
         if (node instanceof BreakNode n) return visitBreak(n);
         if (node instanceof ContinueNode n) return visitContinue(n);
         if (node instanceof LambdaNode n) return visitLambda(n);
@@ -105,10 +110,14 @@ public class Evaluator implements ASTVisitor<Value> {
         if (node instanceof MapLiteralNode n) return visitMapLiteral(n);
         if (node instanceof InterpolatedStringNode n) return visitInterpolatedString(n);
         if (node instanceof FieldAssignmentNode n) return visitFieldAssignment(n);
+        if (node instanceof ConditionalAssignNode n) return visitConditionalAssign(n);
+        if (node instanceof NullCoalescingAssignNode n) return visitNullCoalescingAssign(n);
         if (node instanceof MethodReferenceNode n) return visitMethodReference(n);
         if (node instanceof SafeFieldAccessNode n) return visitSafeFieldAccess(n);
         if (node instanceof SafeMethodCallNode n) return visitSafeMethodCall(n);
         if (node instanceof ThrowNode n) return visitThrow(n);
+        if (node instanceof AssertNode n) return visitAssert(n);
+        if (node instanceof SynchronizedNode n) return visitSynchronized(n);
         if (node instanceof DeleteNode n) return visitDelete(n);
         if (node instanceof LabeledStatementNode n) return visitLabeledStatement(n);
         if (node instanceof ImportNode || node instanceof UsingAliasNode
@@ -141,6 +150,12 @@ public class Evaluator implements ASTVisitor<Value> {
         if (evalContext.hasVariable(name)) {
             return evalContext.getVariable(name);
         }
+        // 方法体内的裸字段引用（如 v += 1 的读取端）解析为普通变量节点，
+        // 但字段被镜像成 $field$ 前缀的变量；名字不是局部变量/形参时回退到镜像
+        String mirror = CustomClassExecutor.mirrorName(name);
+        if (evalContext.hasVariable(mirror)) {
+            return evalContext.getVariable(mirror);
+        }
         if (node.isFieldAccess() && node.getDeclaredType() != null) {
             return Value.NullValue.INSTANCE;
         }
@@ -154,6 +169,36 @@ public class Evaluator implements ASTVisitor<Value> {
         throw new EvalException("Undefined variable: " + name, ErrorCode.EVAL_UNDEFINED_VARIABLE);
     }
 
+    /**
+     * 求值一个解析期未定身份的名字引用。
+     * <p>
+     * 解析期只登记"这里有个名字"，link 阶段判定过一次身份（{@link NameRef.Kind}）；
+     * 但那是解析当时的快照，运行期环境可能已经变了（REPL 里前后两次输入共用运行环境），
+     * 所以这里以运行期符号表为准重新判定一次，判定不出来再退回解析期的结论。
+     * </p>
+     */
+    private Value visitNameRef(NameRefNode node) {
+        String name = node.getName();
+        if (evalContext.hasVariable(name)) {
+            return evalContext.getVariable(name);
+        }
+        // 脚本类方法体内的裸字段引用会被镜像成 $field$ 前缀的变量（同 visitVariable）
+        String mirror = CustomClassExecutor.mirrorName(name);
+        if (evalContext.hasVariable(mirror)) {
+            return evalContext.getVariable(mirror);
+        }
+
+        Class<?> resolved = node.getRef().resolvedClass();
+        if (resolved == null && parseContext != null) {
+            resolved = parseContext.resolveClass(name);
+        }
+        if (resolved != null) {
+            checkClass(resolved); // ★ 安全检查
+            return Value.of(resolved);
+        }
+        throw new EvalException("Undefined variable: " + name, ErrorCode.EVAL_UNDEFINED_VARIABLE);
+    }
+
     private Value visitBinaryOp(BinaryOpNode node) {
         Value left = evaluate(node.getLeft());
         if (node.getOperator() == BinaryOpNode.Operator.NULL_COALESCING) {
@@ -162,6 +207,15 @@ public class Evaluator implements ASTVisitor<Value> {
         }
         if (node.getOperator() == BinaryOpNode.Operator.ELVIS) {
             return left.isTruthy() ? left : evaluate(node.getRight());
+        }
+        // 逻辑短路：右侧仅在需要时求值
+        if (node.getOperator() == BinaryOpNode.Operator.LOGICAL_AND) {
+            if (!left.isTruthy()) return new Value.BooleanValue(false);
+            return new Value.BooleanValue(evaluate(node.getRight()).isTruthy());
+        }
+        if (node.getOperator() == BinaryOpNode.Operator.LOGICAL_OR) {
+            if (left.isTruthy()) return new Value.BooleanValue(true);
+            return new Value.BooleanValue(evaluate(node.getRight()).isTruthy());
         }
         Value right = evaluate(node.getRight());
         OperatorRegistry registry = parseContext.getOperatorRegistry();
@@ -227,48 +281,84 @@ public class Evaluator implements ASTVisitor<Value> {
                 throw new EvalException("No matching unary operator '" + opStr + "' for type '" + opType.getSimpleName() + "'", ErrorCode.EVAL_INVALID_OPERATION);
             }
             case PRE_INCREMENT -> {
-                if (node.getOperand() instanceof VariableNode v) {
-                    Value val = evalContext.getVariable(v.getName());
-                    Value inc = increment(val);
-                    evalContext.assignVariable(v.getName(), inc);
-                    yield inc;
-                }
-                throw new EvalException("Cannot increment non-variable", ErrorCode.EVAL_INVALID_OPERATION);
+                Value inc = increment(evaluate(node.getOperand()));
+                storeLValue(node.getOperand(), inc, "increment");
+                yield inc;
             }
             case POST_INCREMENT -> {
-                if (node.getOperand() instanceof VariableNode v) {
-                    Value val = evalContext.getVariable(v.getName());
-                    Value inc = increment(val);
-                    evalContext.assignVariable(v.getName(), inc);
-                    yield val;
-                }
-                throw new EvalException("Cannot increment non-variable", ErrorCode.EVAL_INVALID_OPERATION);
+                Value val = evaluate(node.getOperand());
+                storeLValue(node.getOperand(), increment(val), "increment");
+                yield val;
             }
             case PRE_DECREMENT -> {
-                if (node.getOperand() instanceof VariableNode v) {
-                    Value val = evalContext.getVariable(v.getName());
-                    Value dec = decrement(val);
-                    evalContext.assignVariable(v.getName(), dec);
-                    yield dec;
-                }
-                throw new EvalException("Cannot decrement non-variable", ErrorCode.EVAL_INVALID_OPERATION);
+                Value dec = decrement(evaluate(node.getOperand()));
+                storeLValue(node.getOperand(), dec, "decrement");
+                yield dec;
             }
             case POST_DECREMENT -> {
-                if (node.getOperand() instanceof VariableNode v) {
-                    Value val = evalContext.getVariable(v.getName());
-                    Value dec = decrement(val);
-                    evalContext.assignVariable(v.getName(), dec);
-                    yield val;
-                }
-                throw new EvalException("Cannot decrement non-variable", ErrorCode.EVAL_INVALID_OPERATION);
+                Value val = evaluate(node.getOperand());
+                storeLValue(node.getOperand(), decrement(val), "decrement");
+                yield val;
             }
         };
+    }
+
+    /**
+     * 将自增/自减的结果写回左值。
+     * <p>支持变量、字段访问（{@code obj.field++}）与数组元素（{@code arr[i]++}）；
+     * 基本类型数组元素通过反射写回底层原生数组，避免写入 {@code asArray()} 产生的装箱副本。</p>
+     */
+    private void storeLValue(ASTNode operand, Value value, String verb) {
+        if (operand instanceof VariableNode v) {
+            evalContext.assignVariable(v.getName(), value);
+            return;
+        }
+        if (operand instanceof NameRefNode n) {
+            // 解析期未定身份的名字：自增/自减写回时按变量处理（同 visitVariable 的兜底口径）
+            evalContext.assignVariable(n.getName(), value);
+            return;
+        }
+        if (operand instanceof FieldAccessNode fa) {
+            Object obj = evaluate(fa.getTarget()).asJavaObject();
+            if (obj == null) throw new EvalException("Cannot access field on null", ErrorCode.EVAL_NULL_POINTER);
+            Class<?> resolvedClass = (obj instanceof Class<?> c) ? c : obj.getClass();
+            try {
+                Field f = resolvedClass.getField(fa.getFieldName());
+                checkFieldWrite(f);
+                Object receiver = (obj instanceof Class<?>) ? null : obj;
+                Object coerced = MethodResolver.coerceArg(f.getType(), value.asJavaObject());
+                f.set(receiver, coerced);
+                // 同步镜像变量：本方法内后续读取字段走的是镜像，不同步会读到自增前的旧值
+                if (isCurrentInstance(obj)) {
+                    storeFieldMirror(fa.getFieldName(), Value.of(coerced));
+                }
+            } catch (EvalException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new EvalException("Field not found: " + fa.getFieldName() + " on " + resolvedClass.getSimpleName(), ErrorCode.EVAL_FIELD_ACCESS_FAILED);
+            }
+            return;
+        }
+        if (operand instanceof ArrayAccessNode aa) {
+            Object raw = evaluate(aa.getArray()).asJavaObject();
+            int i = evaluate(aa.getIndex()).asInt();
+            if (raw == null || !raw.getClass().isArray()) {
+                throw new EvalException("Not an array: " + (raw == null ? "null" : raw.getClass().getSimpleName()), ErrorCode.EVAL_TYPE_MISMATCH);
+            }
+            if (i < 0 || i >= Array.getLength(raw)) {
+                throw new EvalException("Array index out of bounds: " + i, ErrorCode.EVAL_INDEX_OUT_OF_BOUNDS);
+            }
+            Array.set(raw, i, MethodResolver.coerceArg(raw.getClass().getComponentType(), value.asJavaObject()));
+            return;
+        }
+        throw new EvalException("Cannot " + verb + " non-variable", ErrorCode.EVAL_INVALID_OPERATION);
     }
 
     private Value increment(Value v) {
         if (v instanceof Value.IntValue i) return new Value.IntValue(i.getValue() + 1);
         if (v instanceof Value.LongValue l) return new Value.LongValue(l.getValue() + 1);
         if (v instanceof Value.DoubleValue d) return new Value.DoubleValue(d.getValue() + 1.0);
+        if (v instanceof Value.CharValue c) return new Value.CharValue((char) (c.getValue() + 1));
         throw new EvalException("Cannot increment type: " + v.getClass().getSimpleName(), ErrorCode.EVAL_INVALID_OPERATION);
     }
 
@@ -276,21 +366,64 @@ public class Evaluator implements ASTVisitor<Value> {
         if (v instanceof Value.IntValue i) return new Value.IntValue(i.getValue() - 1);
         if (v instanceof Value.LongValue l) return new Value.LongValue(l.getValue() - 1);
         if (v instanceof Value.DoubleValue d) return new Value.DoubleValue(d.getValue() - 1.0);
+        if (v instanceof Value.CharValue c) return new Value.CharValue((char) (c.getValue() - 1));
         throw new EvalException("Cannot decrement type: " + v.getClass().getSimpleName(), ErrorCode.EVAL_INVALID_OPERATION);
     }
 
     private Value visitAssignment(AssignmentNode node) {
         Value value = evaluate(node.getValue());
+        String name = node.getVariableName();
         if (node.isDeclaration()) {
-            evalContext.declareVariable(node.getVariableName(), value);
+            evalContext.declareVariable(name, value);
+            return value;
+        }
+        // 语句层对裸标识符赋值生成的是普通赋值节点，但该名字可能被解析为当前实例的字段。
+        // 名字不是局部变量/形参时按字段处理：除了更新镜像，还要写穿到实例字段，
+        // 否则字段不会更新，本方法内随后的嵌套调用也看不到这次赋值
+        if (!evalContext.hasVariable(name)) {
+            Field instanceField = currentInstanceField(name);
+            if (instanceField == null) {
+                throw new EvalException("Variable not declared: " + name, ErrorCode.SCOPE_VARIABLE_NOT_FOUND);
+            }
+            storeFieldMirror(name, value);
+            writeInstanceField(instanceField, currentInstance(), value);
+            return value;
+        }
+        if (node.isFinal()) {
+            throw new EvalException("Cannot assign to final variable: " + name, ErrorCode.SCOPE_CANNOT_ASSIGN_TO_FINAL);
+        }
+        evalContext.assignVariable(name, value);
+        return value;
+    }
+
+    /**
+     * {@code x ?= v}：等价于 {@code x = x ?: v}（x 为真时保持原值，否则赋 v）。
+     */
+    private Value visitConditionalAssign(ConditionalAssignNode node) {
+        String name = node.getVariableName();
+        Value current = evalContext.hasVariable(name) ? evalContext.getVariable(name) : Value.NullValue.INSTANCE;
+        if (current.isTruthy()) return current;
+        Value value = evaluate(node.getValue());
+        if (evalContext.hasVariable(name)) {
+            evalContext.assignVariable(name, value);
         } else {
-            if (!evalContext.hasVariable(node.getVariableName())) {
-                throw new EvalException("Variable not declared: " + node.getVariableName(), ErrorCode.SCOPE_VARIABLE_NOT_FOUND);
-            }
-            if (node.isFinal()) {
-                throw new EvalException("Cannot assign to final variable: " + node.getVariableName(), ErrorCode.SCOPE_CANNOT_ASSIGN_TO_FINAL);
-            }
-            evalContext.assignVariable(node.getVariableName(), value);
+            evalContext.declareVariable(name, value);
+        }
+        return value;
+    }
+
+    /**
+     * {@code x ??= v}：等价于 {@code x = x ?? v}（x 为 null 时赋 v）。
+     */
+    private Value visitNullCoalescingAssign(NullCoalescingAssignNode node) {
+        String name = node.getVariableName();
+        Value current = evalContext.hasVariable(name) ? evalContext.getVariable(name) : Value.NullValue.INSTANCE;
+        if (!(current instanceof Value.NullValue)) return current;
+        Value value = evaluate(node.getValue());
+        if (evalContext.hasVariable(name)) {
+            evalContext.assignVariable(name, value);
+        } else {
+            evalContext.declareVariable(name, value);
         }
         return value;
     }
@@ -388,7 +521,8 @@ public class Evaluator implements ASTVisitor<Value> {
             // 多态分发：对实例方法，在目标运行时类上查找实际覆写
             if (target != null && !Modifier.isStatic(method.getModifiers())) {
                 try {
-                    Method override = target.getClass().getMethod(method.getName(), method.getParameterTypes());
+                    Method override = MethodResolver.accessible(
+                            target.getClass().getMethod(method.getName(), method.getParameterTypes()));
                     if (override.getDeclaringClass() != method.getDeclaringClass()) {
                         method = override;
                     }
@@ -431,7 +565,7 @@ public class Evaluator implements ASTVisitor<Value> {
         // 遍历所有重载，尝试匹配（支持 varargs）
         Method bestMatch = null;
         int bestScore = Integer.MAX_VALUE;
-        for (Method m : clazz.getMethods()) {
+        for (Method m : ReflectCache.methods(clazz)) {
             if (!m.getName().equals(methodName)) continue;
             // 构造参数类型数组用于 isApplicable 判断
             Class<?>[] argTypes = new Class<?>[args.size()];
@@ -515,6 +649,9 @@ public class Evaluator implements ASTVisitor<Value> {
 
     private static int paramTypeScore(Class<?> paramType, Class<?> argType) {
         if (paramType == argType) return 0;
+        // char 实参：优先精确匹配 char 形参（避免误选 int/Character 重载，如 println(char) vs println(int)）
+        if (argType == Character.class && (paramType == char.class || paramType == Character.class)) return 0;
+        if (paramType == char.class && argType == char.class) return 0;
         if (paramType.isAssignableFrom(argType)) {
             if (paramType == Object.class) return 10;
             return 1;
@@ -581,6 +718,15 @@ public class Evaluator implements ASTVisitor<Value> {
         Value target = evaluate(node.getTarget());
         Object obj = target.asJavaObject();
         if (obj == null) throw new EvalException("Cannot access field on null", ErrorCode.EVAL_NULL_POINTER);
+
+        // 脚本类方法体内的 this.field：字段被 CustomClassExecutor 镜像成局部变量，
+        // 读取必须走镜像变量，否则读到的是尚未写回的旧字段值
+        if (isCurrentInstance(obj)) {
+            String mirror = CustomClassExecutor.mirrorName(node.getFieldName());
+            if (evalContext.hasVariable(mirror)) {
+                return evalContext.getVariable(mirror);
+            }
+        }
 
         // 静态字段访问：target 已经是 Class<?>
         Class<?> resolvedClass = (obj instanceof Class<?> c) ? c : obj.getClass();
@@ -735,15 +881,32 @@ public class Evaluator implements ASTVisitor<Value> {
         Value array = evaluate(node.getArray());
         Value index = evaluate(node.getIndex());
         Value value = evaluate(node.getValue());
-        Object[] arr = array.asArray();
+        Object raw = array.asJavaObject();
         int i = index.asInt();
-        if (i < 0 || i >= arr.length) throw new EvalException("Array index out of bounds: " + i, ErrorCode.EVAL_INDEX_OUT_OF_BOUNDS);
-        arr[i] = value.asJavaObject();
+        if (raw == null || !raw.getClass().isArray()) {
+            throw new EvalException("Not an array: " + (raw == null ? "null" : raw.getClass().getSimpleName()), ErrorCode.EVAL_TYPE_MISMATCH);
+        }
+        if (i < 0 || i >= Array.getLength(raw)) throw new EvalException("Array index out of bounds: " + i, ErrorCode.EVAL_INDEX_OUT_OF_BOUNDS);
+        // 直接写回底层原生数组：asArray() 对基本类型数组会返回装箱副本，写入副本会丢失修改
+        Array.set(raw, i, MethodResolver.coerceArg(raw.getClass().getComponentType(), value.asJavaObject()));
         return value;
     }
 
     private Value visitArrayLiteral(ArrayLiteralNode node) {
         List<Value> elements = evaluateAll(node.getElements());
+
+        // 嵌套数组字面量（{{1}, {2}} / {{"a"}, {"b"}}）：元素本身是数组，
+        // 按元素的运行期类型确定组件类型，构建真正的多维数组；
+        // 否则仅按解析期注释创建 int[2] 之类的低维数组，写入数组元素时会类型不匹配。
+        if (allSameArrayType(elements)) {
+            Class<?> componentType = elements.get(0).asJavaObject().getClass();
+            Object nested = Array.newInstance(componentType, elements.size());
+            for (int i = 0; i < elements.size(); i++) {
+                Array.set(nested, i, elements.get(i).asJavaObject());
+            }
+            return new Value.ArrayValue(nested);
+        }
+
         // 根据解析期类型注释创建对应类型的数组（int[] / double[] / Object[] 等）
         JType type = parseContext != null ? parseContext.getType(node) : null;
         if (type != null && type.getArrayDepth() > 0) {
@@ -759,7 +922,32 @@ public class Evaluator implements ASTVisitor<Value> {
         return new Value.ArrayValue(elements.stream().map(Value::asJavaObject).toArray());
     }
 
+    /** 元素全部为非空数组且运行期类型一致时返回 true（用于识别嵌套数组字面量）。 */
+    private static boolean allSameArrayType(List<Value> elements) {
+        if (elements.isEmpty()) {
+            return false;
+        }
+        Class<?> first = null;
+        for (Value v : elements) {
+            Object raw = v.asJavaObject();
+            if (raw == null || !raw.getClass().isArray()) {
+                return false;
+            }
+            if (first == null) {
+                first = raw.getClass();
+            } else if (first != raw.getClass()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private Value visitNewArray(NewArrayNode node) {
+        // new Type[] {…}：直接用初始化器构建类型化数组
+        if (node.getInitializer() != null) {
+            return buildArrayFromInitializer(node);
+        }
+
         List<ASTNode> sizes = node.getSizes();
         int dimCount = sizes.size();
         // 找到最后一个非 null 维度来确定实际创建深度
@@ -800,6 +988,40 @@ public class Evaluator implements ASTVisitor<Value> {
         return arrayValueFromJavaArray(javaArray, nonNullCount);
     }
 
+    /**
+     * 由花括号初始化器构建类型化数组。
+     * <p>
+     * 支持 {@code new String[] {"a", "b"}} 以及多维嵌套
+     * {@code new int[][] {{1, 2}, {3, 4}}}；元素类型取自声明的类型，
+     * 因此 {@code new String[]{…}} 得到的是 {@code String[]} 而非 {@code Object[]}。
+     * </p>
+     */
+    private Value buildArrayFromInitializer(NewArrayNode node) {
+        Class<?> componentType = node.getElementType() != null ? node.getElementType() : Object.class;
+        // 按声明的维度逐层降维：int[][] 的组件类型是 int[]
+        for (int depth = 1; depth < node.getSizes().size(); depth++) {
+            componentType = Array.newInstance(componentType, 0).getClass();
+        }
+        return new Value.ArrayValue(fillArrayFromInitializer(componentType, node.getInitializer()));
+    }
+
+    private Object fillArrayFromInitializer(Class<?> componentType, ArrayLiteralNode literal) {
+        List<ASTNode> elements = literal.getElements();
+        Object array = Array.newInstance(componentType, elements.size());
+        for (int i = 0; i < elements.size(); i++) {
+            ASTNode element = elements.get(i);
+            if (element instanceof ArrayLiteralNode nested) {
+                Class<?> nestedComponent = componentType.isArray()
+                        ? componentType.getComponentType()
+                        : componentType;
+                Array.set(array, i, fillArrayFromInitializer(nestedComponent, nested));
+            } else {
+                Array.set(array, i, evaluate(element).asJavaObject());
+            }
+        }
+        return array;
+    }
+
     private Value arrayValueFromJavaArray(Object javaArray, int depth) {
         int len = Array.getLength(javaArray);
         if (depth <= 1) {
@@ -828,13 +1050,54 @@ public class Evaluator implements ASTVisitor<Value> {
 
     private Value visitInstanceof(InstanceofNode node) {
         Value value = evaluate(node.getExpression());
-        try {
-            checkClassByName(node.getTypeName()); // ★ 安全检查
-            Class<?> clazz = Class.forName(node.getTypeName());
-            return new Value.BooleanValue(clazz.isInstance(value.asJavaObject()));
-        } catch (ClassNotFoundException e) {
-            throw new EvalException("Unknown type in instanceof: " + node.getTypeName(), ErrorCode.EVAL_CLASS_NOT_FOUND);
+        String typeName = node.getTypeName();
+        checkClassByName(typeName); // ★ 安全检查
+        Class<?> clazz = resolveTypeName(typeName);
+        if (clazz == null) {
+            throw new EvalException("Unknown type in instanceof: " + typeName, ErrorCode.EVAL_CLASS_NOT_FOUND);
         }
+        Object raw = value.asJavaObject();
+        boolean matched = raw != null && clazz.isInstance(raw);
+        // 模式变量绑定：o instanceof String s 匹配成功时把值绑到 s（供 then 分支使用）
+        if (matched && node.getPatternVariable() != null) {
+            evalContext.declareVariable(node.getPatternVariable(), value);
+        }
+        return new Value.BooleanValue(matched);
+    }
+
+    /**
+     * 解析 instanceof / 类型名：支持简单名（含 import）、全限定名以及数组类型（{@code int[]}）。
+     * <p>解析器存入的是源码原文，因此必须经过 {@link ParseContext#resolveClass} 而非直接 Class.forName。</p>
+     */
+    private Class<?> resolveTypeName(String typeName) {
+        if (typeName == null) return null;
+        if (typeName.endsWith("[]")) {
+            Class<?> component = resolveTypeName(typeName.substring(0, typeName.length() - 2));
+            return component == null ? null : Array.newInstance(component, 0).getClass();
+        }
+        Class<?> primitive = primitiveClass(typeName);
+        if (primitive != null) return primitive;
+        Class<?> resolved = parseContext != null ? parseContext.resolveClass(typeName) : null;
+        if (resolved != null) return resolved;
+        try {
+            return Class.forName(typeName);
+        } catch (ClassNotFoundException e) {
+            return null;
+        }
+    }
+
+    private static Class<?> primitiveClass(String name) {
+        return switch (name) {
+            case "boolean" -> boolean.class;
+            case "byte" -> byte.class;
+            case "char" -> char.class;
+            case "short" -> short.class;
+            case "int" -> int.class;
+            case "long" -> long.class;
+            case "float" -> float.class;
+            case "double" -> double.class;
+            default -> null;
+        };
     }
 
     private final PipelineDispatcher pipelineDispatcher = new PipelineDispatcher(this);
@@ -849,6 +1112,15 @@ public class Evaluator implements ASTVisitor<Value> {
     }
 
     private Value visitBlock(BlockNode node) {
+        // 非词法块（多变量声明、for 的逗号更新子句等）：在当前作用域内顺序执行，
+        // 声明的变量必须留在外层，不能被块结束时的子上下文一起丢弃
+        if (!node.isScoped()) {
+            Value result = Value.VoidValue.INSTANCE;
+            for (ASTNode stmt : node.getStatements()) {
+                result = evaluate(stmt);
+            }
+            return result;
+        }
         EvalContext childCtx = evalContext.createChild();
         Evaluator childEval = new Evaluator(childCtx, parseContext);
         Value result = Value.VoidValue.INSTANCE;
@@ -942,40 +1214,96 @@ public class Evaluator implements ASTVisitor<Value> {
     }
 
     private Value visitSwitch(SwitchNode node) {
+        // switch 表达式的值可以来自分支体里的 yield expr;（Java 14+ 冒号风格），
+        // yield 会穿过嵌套块/循环抛到这里
+        try {
+            return evaluateSwitch(node);
+        } catch (YieldException e) {
+            return (Value) e.getValue();
+        }
+    }
+
+    private Value evaluateSwitch(SwitchNode node) {
         Value expr = evaluate(node.getExpression());
-        for (CaseNode caseNode : node.getCases()) {
-            Value caseVal = evaluate(caseNode.getValue());
-            if (expr.equals(caseVal)) {
-                EvalContext childCtx = evalContext.createChild();
-                Evaluator childEval = new Evaluator(childCtx, parseContext);
-                Value result = Value.VoidValue.INSTANCE;
-                for (ASTNode stmt : caseNode.getStatements()) {
-                    try {
-                        result = childEval.evaluate(stmt);
-                    } catch (BreakException e) {
-                        return result;
-                    }
-                }
-                return result;
-            }
+        List<CaseNode> cases = node.getCases();
+
+        int start = -1;
+        for (int i = 0; i < cases.size(); i++) {
+            if (matchesCase(expr, cases.get(i))) { start = i; break; }
         }
+        if (start < 0) {
+            return evaluateDefaultCase(node);
+        }
+
+        Value result = Value.VoidValue.INSTANCE;
+        for (int i = start; i < cases.size(); i++) {
+            CaseNode caseNode = cases.get(i);
+            EvalContext childCtx = evalContext.createChild();
+            Evaluator childEval = new Evaluator(childCtx, parseContext);
+            boolean broke = false;
+            for (ASTNode stmt : caseNode.getStatements()) {
+                try {
+                    result = childEval.evaluate(stmt);
+                } catch (BreakException e) {
+                    broke = true;
+                    break;
+                }
+            }
+            // 命中 break 或箭头式 case：停止，不再贯穿
+            if (broke || caseNode.isArrowStyle()) return result;
+        }
+        // 冒号式 case 贯穿到末尾且未 break → 继续执行 default（Java 中 default 位于末尾时的语义）
         if (node.getDefaultCase() != null) {
-            if (node.getDefaultCase() instanceof BlockNode block) {
-                EvalContext childCtx = evalContext.createChild();
-                Evaluator childEval = new Evaluator(childCtx, parseContext);
-                Value result = Value.VoidValue.INSTANCE;
-                for (ASTNode stmt : block.getStatements()) {
-                    try {
-                        result = childEval.evaluate(stmt);
-                    } catch (BreakException e) {
-                        return result;
-                    }
-                }
-                return result;
-            }
-            return evaluate(node.getDefaultCase());
+            result = evaluateDefaultCase(node);
         }
-        return Value.VoidValue.INSTANCE;
+        return result;
+    }
+
+    /** 判断 case 声明值中是否有一个匹配 switch 表达式（数值类型之间按数值比较，如 long 与 int 常量）。 */
+    private boolean matchesCase(Value expr, CaseNode caseNode) {
+        for (ASTNode valueNode : caseNode.getValues()) {
+            if (switchValuesEqual(expr, evaluate(valueNode))) return true;
+        }
+        return false;
+    }
+
+    private static boolean switchValuesEqual(Value a, Value b) {
+        if (isIntegral(a) && isIntegral(b)) return integralAsLong(a) == integralAsLong(b);
+        if (isNumeric(a) && isNumeric(b)) return Double.compare(a.asDouble(), b.asDouble()) == 0;
+        return a.equals(b);
+    }
+
+    private static boolean isIntegral(Value v) {
+        return v instanceof Value.IntValue || v instanceof Value.LongValue || v instanceof Value.CharValue;
+    }
+
+    private static boolean isNumeric(Value v) {
+        return isIntegral(v) || v instanceof Value.DoubleValue;
+    }
+
+    private static long integralAsLong(Value v) {
+        if (v instanceof Value.IntValue i) return i.getValue();
+        if (v instanceof Value.LongValue l) return l.getValue();
+        return ((Value.CharValue) v).getValue();
+    }
+
+    private Value evaluateDefaultCase(SwitchNode node) {
+        ASTNode defaultCase = node.getDefaultCase();
+        if (defaultCase == null) return Value.VoidValue.INSTANCE;
+        if (defaultCase instanceof BlockNode block) {
+            EvalContext childCtx = evalContext.createChild();
+            Evaluator childEval = new Evaluator(childCtx, parseContext);
+            Value result = Value.VoidValue.INSTANCE;
+            for (ASTNode stmt : block.getStatements()) {
+                try {
+                    result = childEval.evaluate(stmt);
+                } catch (BreakException e) {
+                    return result;
+                }
+            }
+            return result;
+        }
+        return evaluate(defaultCase);
     }
 
     private Value visitReturn(ReturnNode node) {
@@ -984,6 +1312,13 @@ public class Evaluator implements ASTVisitor<Value> {
             throw new ReturnException(val);
         }
         throw new ReturnException(Value.VoidValue.INSTANCE);
+    }
+
+    /**
+     * yield 语句：携带值向上抛出，由最近的 switch 捕获（见 {@link #visitSwitch}）。
+     */
+    private Value visitYield(YieldNode node) {
+        throw new YieldException(evaluate(node.getValue()));
     }
 
     private Value visitBreak(BreakNode node) {
@@ -1152,6 +1487,15 @@ public class Evaluator implements ASTVisitor<Value> {
         }
 
         if (obj == null) throw new EvalException("Cannot set field on null", ErrorCode.EVAL_NULL_POINTER);
+
+        // 脚本类方法体内的 this.field = v：既写镜像变量（本方法后续读取走镜像），
+        // 也立即写穿到实例字段 —— 否则嵌套调用的同类方法读到的还是字段旧值
+        if (isCurrentInstance(obj) && evalContext.hasVariable(CustomClassExecutor.mirrorName(node.getFieldName()))) {
+            storeFieldMirror(node.getFieldName(), value);
+            writeFieldThroughMirror(obj, node.getFieldName(), value);
+            return value;
+        }
+
         try {
             Field f = obj.getClass().getField(node.getFieldName());
             checkFieldWrite(f); // ★ 安全检查
@@ -1160,6 +1504,77 @@ public class Evaluator implements ASTVisitor<Value> {
             throw new EvalException("Field assignment failed: " + node.getFieldName(), e, ErrorCode.EVAL_FIELD_ACCESS_FAILED);
         }
         return value;
+    }
+
+    /**
+     * 判断对象是否为当前脚本类实例。
+     * <p>
+     * {@link CustomClassExecutor} 执行脚本类方法体时，会把实例绑定为 {@code this}，
+     * 并把实例字段镜像成同名局部变量。此判定用于让 {@code this.field} 的读写走镜像变量。
+     * </p>
+     */
+    private boolean isCurrentInstance(Object obj) {
+        if (obj == null || !evalContext.hasVariable("this")) return false;
+        return evalContext.getVariable("this").asJavaObject() == obj;
+    }
+
+    /**
+     * 把脚本类方法体内赋给字段镜像的值立即写进实例字段。
+     * <p>
+     * 字段镜像是 {@link CustomClassExecutor} 为每个方法帧准备的副本，本方法帧的读写都走副本。
+     * 若赋值只停留在副本里，同一方法内后续发起的嵌套调用（{@code n() { s = "a"; all(); }}）
+     * 会从实例上读到字段的旧值。因此这里直接反射写穿，让赋值立即对所有人可见。
+     * </p>
+     */
+    private void writeFieldThroughMirror(Object instance, String fieldName, Value value) {
+        writeInstanceField(findInstanceField(instance.getClass(), fieldName), instance, value);
+    }
+
+    /** 更新字段镜像变量（不存在时创建）。 */
+    private void storeFieldMirror(String fieldName, Value value) {
+        String mirror = CustomClassExecutor.mirrorName(fieldName);
+        if (evalContext.hasVariable(mirror)) {
+            evalContext.assignVariable(mirror, value);
+        } else {
+            evalContext.declareVariable(mirror, value);
+        }
+    }
+
+    /** 当前脚本类方法体的接收者（{@code this} 绑定的实例）；不在脚本类方法体内时返回 null。 */
+    private Object currentInstance() {
+        if (!evalContext.hasVariable("this")) return null;
+        Object self = evalContext.getVariable("this").asJavaObject();
+        if (self == null || self instanceof Class<?>) return null; // 静态方法里 this 绑的是类对象
+        return self;
+    }
+
+    /** 若名字是当前实例的字段，返回对应 Field，否则返回 null。 */
+    private Field currentInstanceField(String fieldName) {
+        Object self = currentInstance();
+        return self == null ? null : findInstanceField(self.getClass(), fieldName);
+    }
+
+    /** 沿类层次查找实例字段（含非 public 字段与父类字段）。 */
+    private static Field findInstanceField(Class<?> clazz, String fieldName) {
+        Class<?> current = clazz;
+        while (current != null && current != Object.class) {
+            try {
+                return current.getDeclaredField(fieldName);
+            } catch (NoSuchFieldException e) {
+                current = current.getSuperclass();
+            }
+        }
+        return null;
+    }
+
+    /** 把值写进实例字段；写不进去（如 final 字段）时静默忽略，退回「只写镜像」的旧行为。 */
+    private static void writeInstanceField(Field field, Object instance, Value value) {
+        if (field == null || instance == null) return;
+        try {
+            field.setAccessible(true);
+            field.set(instance, value.asJavaObject());
+        } catch (Exception ignored) {
+        }
     }
 
     private Value visitMethodReference(MethodReferenceNode node) {
@@ -1382,38 +1797,127 @@ public class Evaluator implements ASTVisitor<Value> {
         Value target = evaluate(node.getTarget());
         if (target instanceof Value.NullValue) return Value.NullValue.INSTANCE;
         Object obj = target.asJavaObject();
+        if (obj == null) return Value.NullValue.INSTANCE;
+        Class<?> resolvedClass = (obj instanceof Class<?> c) ? c : obj.getClass();
+        // 接收者非 null：字段不存在应报错，而不是静默返回 null
         try {
-            Field f = obj.getClass().getField(node.getFieldName());
+            if (resolvedClass.isArray() && "length".equals(node.getFieldName())) {
+                return Value.of(Array.getLength(obj));
+            }
+            Field f = resolvedClass.getField(node.getFieldName());
             checkFieldRead(f); // ★ 安全检查
             return Value.of(f.get(obj));
+        } catch (EvalException e) {
+            throw e;
         } catch (Exception e) {
-            return Value.NullValue.INSTANCE;
+            throw new EvalException("Field not found: " + node.getFieldName() + " on " + resolvedClass.getSimpleName(), ErrorCode.EVAL_FIELD_ACCESS_FAILED);
         }
     }
 
     private Value visitSafeMethodCall(SafeMethodCallNode node) {
         Value target = evaluate(node.getTarget());
         if (target instanceof Value.NullValue) return Value.NullValue.INSTANCE;
-        try {
-            List<Value> args = evaluateAll(node.getArguments());
-            Object obj = target.asJavaObject();
-            String methodName = node.getMethodName();
-            for (Method m : obj.getClass().getMethods()) {
-                if (m.getName().equals(methodName) && m.getParameterCount() == args.size()) {
-                    checkMethod(m); // ★ 安全检查
-                    Object result = m.invoke(obj, args.stream().map(Value::asJavaObject).toArray());
-                    return Value.of(result);
-                }
+        Object obj = target.asJavaObject();
+        if (obj == null) return Value.NullValue.INSTANCE;
+        // 接收者非 null：复用普通方法调用的重载解析与参数转换，方法内部异常正常向外抛
+        List<Value> args = evaluateAll(node.getArguments());
+        return invokeResolvedMethod(obj, node.getMethodName(), args);
+    }
+
+    /**
+     * 在给定目标上按重载规则解析并调用方法（与 {@code visitMethodCall} 的动态分发一致）。
+     */
+    private Value invokeResolvedMethod(Object target, String methodName, List<Value> args) {
+        Class<?> clazz;
+        if (target instanceof Class<?> c) {
+            boolean foundOnClassClass = false;
+            for (Method m : Class.class.getMethods()) {
+                if (m.getName().equals(methodName)) { foundOnClassClass = true; break; }
             }
-            throw new EvalException("Method not found: " + methodName, ErrorCode.METHOD_NO_APPLICABLE_METHOD);
+            clazz = foundOnClassClass ? Class.class : c;
+        } else {
+            clazz = target.getClass();
+        }
+        Method bestMatch = null;
+        int bestScore = Integer.MAX_VALUE;
+        for (Method m : clazz.getMethods()) {
+            if (!m.getName().equals(methodName)) continue;
+            Class<?>[] argTypes = new Class<?>[args.size()];
+            for (int i = 0; i < args.size(); i++) {
+                Object argObj = args.get(i).asJavaObject();
+                argTypes[i] = argObj != null ? argObj.getClass() : Object.class;
+            }
+            if (!MethodResolver.isApplicable(m, argTypes)) continue;
+            int score = computeMethodMatchScore(m, argTypes);
+            if (score < bestScore) {
+                bestScore = score;
+                bestMatch = m;
+            }
+        }
+        if (bestMatch == null) {
+            String typeList = args.isEmpty() ? "()"
+                    : "(" + String.join(", ", args.stream().map(a -> {
+                        Object o = a.asJavaObject();
+                        return o != null ? o.getClass().getName() : "null";
+                    }).toArray(String[]::new)) + ")";
+            throw new EvalException("No applicable method found: " + clazz.getName() + "." + methodName + typeList,
+                    ErrorCode.METHOD_NO_APPLICABLE_METHOD);
+        }
+        try {
+            checkMethod(bestMatch); // ★ 安全检查
+            Object[] javaArgs = prepareInvokeArgs(bestMatch, args);
+            Object result = bestMatch.invoke(target, javaArgs);
+            return Value.of(result);
+        } catch (InvocationTargetException e) {
+            throw new EvalException("Exception in " + methodName + ": " + e.getCause().getMessage(), e.getCause(), ErrorCode.EVAL_EXCEPTION_THROWN);
+        } catch (EvalException e) {
+            throw e;
         } catch (Exception e) {
-            return Value.NullValue.INSTANCE;
+            throw new EvalException("Method call failed: " + methodName + " (" + e.getMessage() + ")", e, ErrorCode.METHOD_INVOCATION_FAILED);
         }
     }
 
     private Value visitThrow(ThrowNode node) {
         Value val = evaluate(node.getExpression());
         throw new EvalException("Uncaught throw: " + val, ErrorCode.EVAL_EXCEPTION_THROWN);
+    }
+
+    /**
+     * assert 语句：条件为假时抛出断言失败。
+     * <p>
+     * 失败以 {@link EvalException} 抛出，并把 {@link AssertionError} 作为 cause，
+     * 因此 {@code catch (AssertionError e)} 与 {@code catch (Exception e)} 都能捕获。
+     * </p>
+     */
+    private Value visitAssert(AssertNode node) {
+        if (evaluate(node.getCondition()).isTruthy()) {
+            return Value.VoidValue.INSTANCE;
+        }
+
+        String detail = null;
+        if (node.hasMessage()) {
+            Object message = evaluate(node.getMessage()).asJavaObject();
+            detail = String.valueOf(message);
+        }
+        String message = detail != null ? "Assertion failed: " + detail : "Assertion failed";
+        throw new EvalException(message, new AssertionError(message), ErrorCode.EVAL_ASSERTION_FAILED);
+    }
+
+    /**
+     * synchronized 语句：以 lock 对象的监视器执行临界区。
+     * <p>
+     * 控制流异常（return/break/continue）会自然穿过 synchronized 块并释放监视器，
+     * 因此这里不需要额外的 finally 处理。
+     * </p>
+     */
+    private Value visitSynchronized(SynchronizedNode node) {
+        Object monitor = evaluate(node.getLock()).asJavaObject();
+        if (monitor == null) {
+            throw new EvalException("Cannot synchronize on null", ErrorCode.EVAL_NULL_POINTER);
+        }
+        synchronized (monitor) {
+            return evaluate(node.getBody());
+        }
     }
 
     private Value visitDelete(DeleteNode node) {
@@ -1451,22 +1955,63 @@ public class Evaluator implements ASTVisitor<Value> {
     }
 
     private Value visitTry(TryNode node) {
+        ASTNode finallyBlock = node.getFinallyBlock();
+        Value result;
         try {
-            return evaluate(node.getTryBlock());
-        } catch (BreakException | ContinueException | ReturnException | LabeledBreakException e) {
+            result = evaluate(node.getTryBlock());
+        } catch (BreakException | ContinueException | ReturnException | YieldException
+                 | LabeledBreakException e) {
+            // 控制流异常：finally 仍须执行（其自身的 return/throw 会覆盖当前控制流）
+            if (finallyBlock != null) evaluate(finallyBlock);
             throw e;
         } catch (Exception e) {
+            CatchClause matched = null;
             for (CatchClause catchClause : node.getCatchClauses()) {
+                if (matchesCatch(catchClause, e)) { matched = catchClause; break; }
+            }
+            if (matched == null) {
+                if (finallyBlock != null) evaluate(finallyBlock);
+                throw e;
+            }
+            Value catchResult;
+            try {
                 EvalContext catchCtx = evalContext.createChild();
-                catchCtx.declareVariable(catchClause.getVariableName(), Value.of(e));
+                catchCtx.declareVariable(matched.getVariableName(), Value.of(e));
                 Evaluator catchEval = new Evaluator(catchCtx, parseContext);
-                return catchEval.evaluate(catchClause.getBody());
+                catchResult = catchEval.evaluate(matched.getBody());
+            } catch (BreakException | ContinueException | ReturnException | YieldException
+                     | LabeledBreakException ctl) {
+                if (finallyBlock != null) evaluate(finallyBlock);
+                throw ctl;
+            } catch (Exception inner) {
+                if (finallyBlock != null) evaluate(finallyBlock);
+                throw inner;
             }
-            if (node.getFinallyBlock() != null) {
-                evaluate(node.getFinallyBlock());
-            }
-            throw e;
+            if (finallyBlock != null) evaluate(finallyBlock);
+            return catchResult;
         }
+        if (finallyBlock != null) evaluate(finallyBlock);
+        return result;
+    }
+
+    /**
+     * 判断 catch 子句是否匹配给定异常。
+     * <p>局限于：{@code throw} 目前统一抛出 {@link EvalException}，因此按声明类型匹配时同时考虑
+     * 异常自身与其 {@code cause}（方法调用内部抛出的 Java 异常被包装为 EvalException 的 cause）。
+     * 未声明类型（解析失败得到 null）时按兼容策略视为可捕获一切。</p>
+     */
+    private static boolean matchesCatch(CatchClause catchClause, Throwable thrown) {
+        List<Class<?>> types = catchClause.getExceptionTypes();
+        if (types == null || types.isEmpty()) return true;
+        boolean hasUsableType = false;
+        for (Class<?> type : types) {
+            if (type == null) continue;
+            hasUsableType = true;
+            if (type.isInstance(thrown)) return true;
+            if (thrown.getCause() != null && type.isInstance(thrown.getCause())) return true;
+        }
+        // 所有声明类型都无法解析 → 保持旧的“捕获一切”行为
+        return !hasUsableType;
     }
 
 

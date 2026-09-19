@@ -252,6 +252,143 @@ public class DeclParserTest {
         assertTrue(node.getModifiers().isAbstract());
     }
 
+    @Test
+    public void strictfpClass() throws CythavaParseException {
+        ClassDeclarationNode node = assertDecl(ClassDeclarationNode.class,
+                "strictfp class Precise {}");
+        assertTrue(node.getModifiers().isStrictfp());
+    }
+
+    @Test
+    public void volatileField() throws CythavaParseException {
+        ClassDeclarationNode node = assertDecl(ClassDeclarationNode.class,
+                "class Shared { volatile int counter; }");
+        assertTrue(node.getFields().get(0).getModifiers().isVolatile());
+    }
+
+    @Test
+    public void transientField() throws CythavaParseException {
+        ClassDeclarationNode node = assertDecl(ClassDeclarationNode.class,
+                "class Cached { transient String blob; }");
+        assertTrue(node.getFields().get(0).getModifiers().isTransient());
+    }
+
+    @Test
+    public void strictfpMethod() throws CythavaParseException {
+        ClassDeclarationNode node = assertDecl(ClassDeclarationNode.class,
+                "class Precise { strictfp double half(double x) { return x; } }");
+        assertTrue(node.getMethods().get(0).getModifiers().isStrictfp());
+    }
+
+    @Test
+    public void combinedNewModifiers() throws CythavaParseException {
+        ClassDeclarationNode node = assertDecl(ClassDeclarationNode.class,
+                "class Mixed { public static volatile transient int state; }");
+        ClassModifiers mods = node.getFields().get(0).getModifiers();
+        assertTrue(mods.isPublic());
+        assertTrue(mods.isStatic());
+        assertTrue(mods.isVolatile());
+        assertTrue(mods.isTransient());
+        assertEquals(0x0001 | 0x0008 | 0x0040 | 0x0080, mods.toAccessFlags());
+    }
+
+    // ==================== 记录 / sealed ====================
+
+    @Test
+    public void recordDeclarationParsesComponents() throws CythavaParseException {
+        ClassDeclarationNode node = assertDecl(ClassDeclarationNode.class,
+                "record Point(int x, int y) {}");
+        assertTrue(node.isRecord());
+        assertEquals(2, node.getRecordComponents().size());
+        assertEquals("x", node.getRecordComponents().get(0).getParameterName());
+        assertEquals("y", node.getRecordComponents().get(1).getParameterName());
+    }
+
+    @Test
+    public void recordIsFinalByDefault() throws CythavaParseException {
+        ClassDeclarationNode node = assertDecl(ClassDeclarationNode.class,
+                "record Point(int x) {}");
+        assertTrue(node.getModifiers().isFinal());
+    }
+
+    @Test
+    public void recordComponentBecomesFinalField() throws CythavaParseException {
+        ClassDeclarationNode node = assertDecl(ClassDeclarationNode.class,
+                "record Point(int x) {}");
+        FieldDeclarationNode field = node.getFields().get(0);
+        assertEquals("x", field.getFieldName());
+        assertTrue(field.getModifiers().isFinal());
+    }
+
+    @Test
+    public void recordGeneratesCanonicalConstructorAndAccessors() throws CythavaParseException {
+        ClassDeclarationNode node = assertDecl(ClassDeclarationNode.class,
+                "record Point(int x, int y) {}");
+        assertEquals(1, node.getConstructors().size());
+        assertEquals(2, node.getConstructors().get(0).getParameters().size());
+        // 组件访问器（另有隐式三件套 equals / hashCode / toString，故不按方法总数断言）
+        assertTrue(node.getMethods().stream().anyMatch(m -> "x".equals(m.getMethodName())));
+        assertTrue(node.getMethods().stream().anyMatch(m -> "y".equals(m.getMethodName())));
+    }
+
+    @Test
+    public void recordKeepsExtraMembers() throws CythavaParseException {
+        ClassDeclarationNode node = assertDecl(ClassDeclarationNode.class,
+                "record Point(int x) { int doubled() { return x * 2; } }");
+        // 访问器 x + 手写的 doubled 都保留（另有隐式三件套）
+        assertTrue(node.getMethods().stream().anyMatch(m -> "x".equals(m.getMethodName())));
+        assertTrue(node.getMethods().stream().anyMatch(m -> "doubled".equals(m.getMethodName())));
+    }
+
+    @Test
+    public void recordWithGenericComponent() throws CythavaParseException {
+        ClassDeclarationNode node = assertDecl(ClassDeclarationNode.class,
+                "record Box<T>(T value) {}");
+        assertTrue(node.isRecord());
+        assertTrue(node.isGeneric());
+        assertEquals("T", node.getRecordComponents().get(0).getType().getTypeName());
+    }
+
+    @Test
+    public void recordMayImplementInterface() throws CythavaParseException {
+        ClassDeclarationNode node = assertDecl(ClassDeclarationNode.class,
+                "record Point(int x) implements Comparable {}");
+        assertEquals(1, node.getInterfaces().size());
+    }
+
+    @Test
+    public void recordNameIsStillUsableAsMemberName() throws CythavaParseException {
+        ClassDeclarationNode node = assertDecl(ClassDeclarationNode.class,
+                "class Names { int record = 1; int sealed = 2; int permits = 3; }");
+        assertEquals(3, node.getFields().size());
+    }
+
+    @Test
+    public void sealedClassWithPermits() throws CythavaParseException {
+        ClassDeclarationNode node = assertDecl(ClassDeclarationNode.class,
+                "sealed class Shape permits Circle, Square {}");
+        assertTrue(node.getModifiers().isSealed());
+        assertEquals(2, node.getPermittedSubclasses().size());
+        assertEquals("Circle", node.getPermittedSubclasses().get(0).getTypeName());
+        assertEquals("Square", node.getPermittedSubclasses().get(1).getTypeName());
+    }
+
+    @Test
+    public void nonSealedClass() throws CythavaParseException {
+        ClassDeclarationNode node = assertDecl(ClassDeclarationNode.class,
+                "non-sealed class Circle extends Shape {}");
+        assertTrue(node.getModifiers().isNonSealed());
+    }
+
+    @Test
+    public void sealedInterfaceWithPermits() throws CythavaParseException {
+        ClassDeclarationNode node = assertDecl(ClassDeclarationNode.class,
+                "sealed interface Shape permits Circle {}");
+        assertTrue(node.isInterface());
+        assertTrue(node.getModifiers().isSealed());
+        assertEquals(1, node.getPermittedSubclasses().size());
+    }
+
     // ==================== 组合测试 ====================
 
     @Test
@@ -275,6 +412,32 @@ public class DeclParserTest {
                 "enum C { X }" +
                 "int helper(int x) { return x; }");
         assertEquals(4, decls.size());
+    }
+
+    // ==================== 泛型闭合符 >> / >>> 的拆分 ====================
+
+    /**
+     * 类型参数上界里的 {@code >>}。
+     * <p>
+     * {@code class G<T extends Comparable<T>>} 的两个 {@code >} 分属"上界泛型"和"类型参数表"两层，
+     * 而前者由另一个 TypeParser 实例解析 → 拆分状态必须跨实例共享，否则外层会误报
+     * "Expected '>' after type parameter list"。
+     * </p>
+     */
+    @Test
+    public void boundedTypeParamClosedByShiftOperator() {
+        ClassDeclarationNode decl = assertDecl(ClassDeclarationNode.class,
+                "class G<T extends Comparable<T>> { T v; }");
+        assertEquals("G", decl.getClassName());
+        assertEquals(List.of("T"), decl.getTypeParameters());
+        assertEquals("Comparable<T>", decl.getTypeParameterBound("T").getTypeName());
+    }
+
+    /** 嵌套泛型用 {@code >>} / {@code >>>} 闭合。 */
+    @Test
+    public void nestedGenericClosedByShiftOperators() {
+        assertDecl(ClassDeclarationNode.class, "class H { Map<String, List<Integer>> m; }");
+        assertDecl(ClassDeclarationNode.class, "class I { List<List<List<String>>> xs; }");
     }
 
     // ==================== 错误处理 ====================

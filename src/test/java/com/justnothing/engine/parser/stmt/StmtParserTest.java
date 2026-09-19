@@ -75,6 +75,16 @@ public class StmtParserTest {
         }
     }
 
+    private void assertParseErrorContaining(String source, String expectedFragment) {
+        try {
+            parse(source);
+            fail("Expected parse error for: " + source);
+        } catch (CythavaParseException expected) {
+            assertTrue("错误信息应包含 '" + expectedFragment + "'，实际: " + expected.getMessage(),
+                    expected.getMessage().contains(expectedFragment));
+        }
+    }
+
     // ==================== 表达式语句 ====================
 
     @Test
@@ -88,6 +98,32 @@ public class StmtParserTest {
     public void methodCallStatement() {
         ASTNode node = assertStmt(ASTNode.class, "foo();");
         assertNotNull(node);
+    }
+
+    // ==================== 泛型尖括号 vs 比较运算符的消歧 ====================
+
+    /** {@code x < y;} 是比较表达式语句，不是"类型 x<y>"的声明。
+     *  修复前：只要看到裸名字后面跟 {@code <} 就判定为声明，随即按类型解析而报
+     *  "Expected '>' after type arguments"。 */
+    @Test
+    public void lessThanIsComparisonNotGenericType() {
+        BinaryOpNode node = assertStmt(BinaryOpNode.class, "x < y;");
+        assertEquals(BinaryOpNode.Operator.LESS_THAN, node.getOperator());
+    }
+
+    /** 尖括号内容不是类型实参的形状（{@code &&}）→ 比较表达式语句。 */
+    @Test
+    public void logicalAndInsideAngleBracketsIsComparison() {
+        BinaryOpNode node = assertStmt(BinaryOpNode.class, "a < b && c > d;");
+        assertEquals(BinaryOpNode.Operator.LOGICAL_AND, node.getOperator());
+    }
+
+    /** 括号配对且后面紧跟声明符 → 仍是变量声明（与 javac 取向一致）。 */
+    @Test
+    public void angleBracketsFollowedByDeclaratorIsDeclaration() {
+        ASTNode node = assertStmt(ASTNode.class, "List<String> xs = null;");
+        assertTrue("应解析为变量声明，实际为 " + node.getClass().getSimpleName(),
+                node instanceof VarDeclNode);
     }
 
     // ==================== 块语句 ====================
@@ -200,6 +236,145 @@ public class StmtParserTest {
     public void throwStatement() {
         ThrowNode node = assertStmt(ThrowNode.class, "throw new Exception(\"error\");");
         assertNotNull(node.getExpression());
+    }
+
+    // ==================== Assert 语句 ====================
+
+    @Test
+    public void assertWithoutMessage() {
+        AssertNode node = assertStmt(AssertNode.class, "assert x > 0;");
+        assertNotNull(node.getCondition());
+        assertNull(node.getMessage());
+        assertFalse(node.hasMessage());
+    }
+
+    @Test
+    public void assertWithMessage() {
+        AssertNode node = assertStmt(AssertNode.class, "assert x > 0 : \"x must be positive\";");
+        assertNotNull(node.getCondition());
+        assertNotNull(node.getMessage());
+        assertTrue(node.hasMessage());
+    }
+
+    @Test
+    public void assertMessageMayBeNonLiteral() {
+        AssertNode node = assertStmt(AssertNode.class, "assert x > 0 : \"bad x: \" + x;");
+        assertNotNull(node.getMessage());
+    }
+
+    @Test
+    public void assertRequiresSemicolon() {
+        assertParseError("assert x > 0");
+    }
+
+    // ==================== static_assert 语句 ====================
+
+    private void assertStaticAssertPasses(String source) {
+        try {
+            parse(source);
+        } catch (CythavaParseException e) {
+            fail("static_assert 应通过: " + source + "，实际: " + e.getMessage());
+        }
+    }
+
+    @Test
+    public void staticAssertPassesOnTrueConstant() throws CythavaParseException {
+        ASTNode node = parse("static_assert(1 + 1 == 2);");
+        // 语法糖：判定通过后不留节点，只剩一个空语句占位
+        assertTrue("static_assert 应被消解为空语句，实际 " + node.getClass().getSimpleName(),
+                node instanceof LiteralNode);
+    }
+
+    @Test
+    public void staticAssertWithMessage() {
+        assertStaticAssertPasses("static_assert(2 > 1, \"sanity\");");
+    }
+
+    @Test
+    public void staticAssertFoldsArithmetic() {
+        assertStaticAssertPasses("static_assert(1 + 2 * 3 == 7);");
+    }
+
+    @Test
+    public void staticAssertFoldsBitwise() {
+        assertStaticAssertPasses("static_assert((1 | 2) == 3);");
+    }
+
+    @Test
+    public void staticAssertFoldsUnaryLogicalNot() {
+        assertStaticAssertPasses("static_assert(!(1 > 2));");
+    }
+
+    @Test
+    public void staticAssertFoldsLogicalAnd() {
+        assertStaticAssertPasses("static_assert((1 < 2) && (3 > 2));");
+    }
+
+    @Test
+    public void staticAssertFoldsTernary() {
+        assertStaticAssertPasses("static_assert(1 + 2 == 3 ? true : false);");
+    }
+
+    @Test
+    public void staticAssertFailsOnFalseConstant() {
+        assertParseErrorContaining("static_assert(1 > 2);", "条件不成立");
+    }
+
+    @Test
+    public void staticAssertFailureMessageIsReported() {
+        assertParseErrorContaining("static_assert(false, \"math is broken\");", "math is broken");
+    }
+
+    @Test
+    public void staticAssertRejectsNonBooleanConstant() {
+        assertParseErrorContaining("static_assert(1 + 1);", "布尔常量表达式");
+    }
+
+    @Test
+    public void staticAssertRejectsRuntimeExpression() {
+        assertParseErrorContaining("static_assert(x > 0);", "编译期常量表达式");
+    }
+
+    @Test
+    public void staticAssertRequiresParentheses() {
+        assertParseError("static_assert true;");
+    }
+
+    // ==================== yield 语句 ====================
+
+    @Test
+    public void yieldStatement() {
+        YieldNode node = assertStmt(YieldNode.class, "yield 5;");
+        assertNotNull(node.getValue());
+    }
+
+    @Test
+    public void yieldIsRestrictedIdentifier() {
+        // 后面跟运算符时 yield 是普通标识符：yield + 1 不能被当成 yield 语句
+        ASTNode node = assertStmt(ASTNode.class, "yield + 1;");
+        assertFalse("yield + 1 应解析为加法表达式，实际 " + node.getClass().getSimpleName(),
+                node instanceof YieldNode);
+    }
+
+    // ==================== synchronized 语句 ====================
+
+    @Test
+    public void synchronizedStatement() {
+        SynchronizedNode node = assertStmt(SynchronizedNode.class, "synchronized (lock) { x = 1; }");
+        assertNotNull(node.getLock());
+        assertTrue(node.getBody() instanceof BlockNode);
+    }
+
+    @Test
+    public void synchronizedStatementWithoutBlock() {
+        SynchronizedNode node = assertStmt(SynchronizedNode.class, "synchronized (lock) x = 1;");
+        assertNotNull(node.getBody());
+    }
+
+    @Test
+    public void synchronizedModifierIsNotAStatement() {
+        // 不带 '(' 的 synchronized 是修饰符，不是语句 → 语句级解析报错
+        assertParseError("synchronized;");
     }
 
     // ==================== Try-Catch ====================

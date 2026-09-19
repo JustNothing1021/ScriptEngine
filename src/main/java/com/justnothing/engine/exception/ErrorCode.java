@@ -34,6 +34,7 @@ public enum ErrorCode {
     PARSE_INVALID_CAST("PARSE_012", "Invalid cast"),
     PARSE_INVALID_METHOD_REFERENCE("PARSE_013", "Invalid method reference"),
     PARSE_CLASS_NOT_FOUND("PARSE_014", "Class not found"),
+    PARSE_UNKNOWN_MEMBER("PARSE_015", "Unknown field or member"),
     
     // 求值错误 (EVAL_xxx)
     EVAL_ERROR("EVAL_000", "Evaluation error"),
@@ -52,6 +53,7 @@ public enum ErrorCode {
     EVAL_CLASS_NOT_FOUND("EVAL_013", "Class not found"),
     EVAL_EXCEPTION_THROWN("EVAL_014", "Exception thrown"),
     EVAL_PERMISSION_DENIED("EVAL_015", "Permission denied"),
+    EVAL_ASSERTION_FAILED("EVAL_016", "Assertion failed"),
     
     // 作用域错误 (SCOPE_xxx)
     SCOPE_VARIABLE_ALREADY_DECLARED("SCOPE_001", "Variable already declared in current scope"),

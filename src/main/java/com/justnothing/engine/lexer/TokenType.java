@@ -51,6 +51,8 @@ public enum TokenType {
     KEYWORD_FINALLY(Keywords.FINALLY),
     KEYWORD_THROW(Keywords.THROW),
     KEYWORD_THROWS(Keywords.THROWS),
+    KEYWORD_ASSERT(Keywords.ASSERT),
+    KEYWORD_STATIC_ASSERT(Keywords.STATIC_ASSERT),
     KEYWORD_IMPORT(Keywords.IMPORT),
     KEYWORD_DELETE(Keywords.DELETE),
     KEYWORD_CLASS(Keywords.CLASS),
@@ -68,6 +70,9 @@ public enum TokenType {
     KEYWORD_ABSTRACT(Keywords.ABSTRACT),
     KEYWORD_NATIVE(Keywords.NATIVE),
     KEYWORD_SYNCHRONIZED(Keywords.SYNCHRONIZED),
+    KEYWORD_VOLATILE(Keywords.VOLATILE),
+    KEYWORD_TRANSIENT(Keywords.TRANSIENT),
+    KEYWORD_STRICTFP(Keywords.STRICTFP),
     KEYWORD_SUPER(Keywords.SUPER),
     KEYWORD_THIS(Keywords.THIS),
     KEYWORD_ASYNC(Keywords.ASYNC),
@@ -196,11 +201,12 @@ public enum TokenType {
                     Keywords.FINAL, Keywords.NEW, Keywords.INSTANCEOF,
                     Keywords.SWITCH, Keywords.CASE, Keywords.DEFAULT,
                     Keywords.TRY, Keywords.CATCH, Keywords.FINALLY,
-                    Keywords.THROW, Keywords.THROWS,
+                    Keywords.THROW, Keywords.THROWS, Keywords.ASSERT, Keywords.STATIC_ASSERT,
                     Keywords.IMPORT, Keywords.DELETE,
                     Keywords.CLASS, Keywords.INTERFACE, Keywords.EXTENDS, Keywords.IMPLEMENTS,
                     Keywords.PUBLIC, Keywords.PRIVATE, Keywords.PROTECTED,
                     Keywords.STATIC, Keywords.ABSTRACT, Keywords.NATIVE, Keywords.SYNCHRONIZED,
+                    Keywords.VOLATILE, Keywords.TRANSIENT, Keywords.STRICTFP,
                     Keywords.SUPER, Keywords.THIS,
                     Keywords.ASYNC, Keywords.AWAIT, Keywords.USING,
                     Keywords.PACKAGE, Keywords.ENUM
@@ -246,6 +252,8 @@ public enum TokenType {
             case Keywords.FINALLY -> KEYWORD_FINALLY;
             case Keywords.THROW -> KEYWORD_THROW;
             case Keywords.THROWS -> KEYWORD_THROWS;
+            case Keywords.ASSERT -> KEYWORD_ASSERT;
+            case Keywords.STATIC_ASSERT -> KEYWORD_STATIC_ASSERT;
             case Keywords.IMPORT -> KEYWORD_IMPORT;
             case Keywords.DELETE -> KEYWORD_DELETE;
             case Keywords.CLASS -> KEYWORD_CLASS;
@@ -259,6 +267,9 @@ public enum TokenType {
             case Keywords.ABSTRACT -> KEYWORD_ABSTRACT;
             case Keywords.NATIVE -> KEYWORD_NATIVE;
             case Keywords.SYNCHRONIZED -> KEYWORD_SYNCHRONIZED;
+            case Keywords.VOLATILE -> KEYWORD_VOLATILE;
+            case Keywords.TRANSIENT -> KEYWORD_TRANSIENT;
+            case Keywords.STRICTFP -> KEYWORD_STRICTFP;
             case Keywords.SUPER -> KEYWORD_SUPER;
             case Keywords.THIS -> KEYWORD_THIS;
             case Keywords.ASYNC -> KEYWORD_ASYNC;

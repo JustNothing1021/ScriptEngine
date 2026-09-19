@@ -489,6 +489,10 @@ public final class DynamicClassGenerator {
             CustomClassExecutor.registerMethod(
                     className, INIT, descriptor,
                     wrapConstructorAsMethod(ctor));
+            // ★ 构造器体由 CustomClassExecutor 解释执行（在此之前只注册不调用，
+            //   导致构造器体内的字段赋值等逻辑从未运行）
+            emitExecuteCall(mv, className, INIT, descriptor, false, ctor.getParameters());
+            mv.visitInsn(Opcodes.POP); // 丢弃 execute 的 Object 返回值（构造器返回 void）
         }
 
         mv.visitInsn(Opcodes.RETURN);
@@ -639,6 +643,35 @@ public final class DynamicClassGenerator {
         MethodVisitor mv = cw.visitMethod(mods, methodName, descriptor, null, null);
         mv.visitCode();
 
+        boolean isStatic = method.getModifiers() != null && method.getModifiers().isStatic();
+        List<ParameterNode> params = method.getParameters();
+        emitExecuteCall(mv, className, methodName, descriptor, isStatic, params);
+
+        // 拆箱并返回
+        unboxAndReturn(mv, returnDesc);
+
+        int paramCount = params != null ? params.size() : 0;
+        int maxLocals = paramCount + (isStatic ? 0 : 1);
+        mv.visitMaxs(6 + paramCount * 2, maxLocals);
+        mv.visitEnd();
+    }
+
+    /**
+     * 生成调用 {@link CustomClassExecutor#execute} 的字节码序列：
+     * {@code execute(className, methodName, descriptor, this|static-null, Object[] args)}。
+     * <p>
+     * 调用结束后栈顶为该方法的 Object 结果，由调用方决定拆箱返回还是直接 POP。
+     * </p>
+     *
+     * @param mv         目标方法访问器
+     * @param className  脚本类名（executor 注册表键）
+     * @param methodName 方法名（构造器为 {@code <init>}）
+     * @param descriptor 完整 JVM 描述符
+     * @param isStatic   是否为静态方法（决定第二个对象参数是 null 还是 this）
+     * @param params     方法/构造器参数列表
+     */
+    private static void emitExecuteCall(MethodVisitor mv, String className, String methodName,
+                                        String descriptor, boolean isStatic, List<ParameterNode> params) {
         // LDC className
         mv.visitLdcInsn(className);
         // LDC methodName
@@ -647,7 +680,6 @@ public final class DynamicClassGenerator {
         mv.visitLdcInsn(descriptor);
 
         // this / null (static)
-        boolean isStatic = method.getModifiers() != null && method.getModifiers().isStatic();
         if (isStatic) {
             mv.visitInsn(Opcodes.ACONST_NULL);
         } else {
@@ -655,7 +687,7 @@ public final class DynamicClassGenerator {
         }
 
         // Object[] args
-        int paramCount = method.getParameters() != null ? method.getParameters().size() : 0;
+        int paramCount = params != null ? params.size() : 0;
         if (paramCount > 0) {
             pushInt(mv, paramCount);
             mv.visitTypeInsn(Opcodes.ANEWARRAY, OBJECT);
@@ -664,22 +696,15 @@ public final class DynamicClassGenerator {
             for (int i = 0; i < paramCount; i++) {
                 mv.visitInsn(Opcodes.DUP);
                 pushInt(mv, i);
-                loadAndBox(mv, method.getParameters().get(i), slot);
+                loadAndBox(mv, params.get(i), slot);
                 mv.visitInsn(Opcodes.AASTORE);
-                slot += slotSize(method.getParameters().get(i));
+                slot += slotSize(params.get(i));
             }
         } else {
             mv.visitInsn(Opcodes.ACONST_NULL);
         }
 
         mv.visitMethodInsn(Opcodes.INVOKESTATIC, EXECUTE_CLASS, EXECUTE_METHOD, EXECUTE_SIGNATURE, false);
-
-        // 拆箱并返回
-        unboxAndReturn(mv, returnDesc);
-
-        int maxLocals = paramCount + (isStatic ? 0 : 1);
-        mv.visitMaxs(6 + paramCount * 2, maxLocals);
-        mv.visitEnd();
     }
 
     private static void loadAndBox(MethodVisitor mv, ParameterNode param, int slot) {

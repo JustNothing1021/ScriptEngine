@@ -72,6 +72,35 @@ public class Preprocessor {
     private static final Pattern ENDIF_PATTERN         = Pattern.compile("^#endif$");
     private static final Pattern PRAGMA_PATTERN        = Pattern.compile("^#pragma\\s+(\\w+)\\s*(.*)$");
     private static final Pattern INCLUDE_PATTERN       = Pattern.compile("^#include\\s+[\"<]([^\">]+)[\">]$");
+    /** #if 条件表达式：左值/比较符/右值。 */
+    private static final Pattern CONDITION_COMPARISON  = Pattern.compile("(\\w+)\\s*(==|!=|>=|<=|>|<)\\s*(\\w+)");
+    /** #if 条件表达式：逻辑非。 */
+    private static final Pattern CONDITION_NOT        = Pattern.compile("!\\s*(\\w+)");
+
+    /**
+     * 宏名 → 预编译的字边界 Pattern（{@code \bNAME\b}），宏集合变化时整体失效。
+     * <p>避免 expandMacros 对每一行、每一个宏都重新 Pattern.compile（JFR 采样里相当比例
+     * 的耗时会落在 java.util.regex 上）。
+     */
+    private final Map<String, Pattern> macroWordPatterns = new HashMap<>();
+    /** 宏名 → 预编译的"宏名 + 可选空白 + ("Pattern，用于函数式宏。 */
+    private final Map<String, Pattern> macroCallPatterns = new HashMap<>();
+
+    private Pattern macroWordPattern(String name) {
+        return macroWordPatterns.computeIfAbsent(name,
+                n -> Pattern.compile("\\b" + Pattern.quote(n) + "\\b"));
+    }
+
+    private Pattern macroCallPattern(String name) {
+        return macroCallPatterns.computeIfAbsent(name,
+                n -> Pattern.compile("\\b" + Pattern.quote(n) + "\\s*\\("));
+    }
+
+    /** 宏集合发生变化时清空预编译 Pattern 缓存。 */
+    private void invalidateMacroPatterns() {
+        macroWordPatterns.clear();
+        macroCallPatterns.clear();
+    }
 
     public Preprocessor() {
         macros.put("true", new Macro("true", "true"));
@@ -130,7 +159,7 @@ public class Preprocessor {
         }
 
         // 先检查是否开启多行字符串（在 expandMacros 之前，因为 expandMacros 会破坏 """）
-        int openPos = findTripleQuote(originalLine, 0);
+        int openPos = originalLine.indexOf('"') < 0 ? -1 : findTripleQuote(originalLine, 0);
         if (openPos >= 0) {
             int closePos = findTripleQuote(originalLine, openPos + 3);
             if (closePos < 0) {
@@ -152,12 +181,12 @@ public class Preprocessor {
      * @return 三引号的起始索引，未找到返回 -1
      */
     private static int findTripleQuote(String text, int fromIndex) {
-        for (int i = fromIndex; i < text.length() - 2; i++) {
-            if (text.charAt(i) == '"'
-                    && text.charAt(i + 1) == '"'
-                    && text.charAt(i + 2) == '"') {
+        int i = text.indexOf('"', fromIndex);
+        while (i >= 0 && i <= text.length() - 3) {
+            if (text.charAt(i + 1) == '"' && text.charAt(i + 2) == '"') {
                 return i;
             }
+            i = text.indexOf('"', i + 1);
         }
         return -1;
     }
@@ -182,6 +211,7 @@ public class Preprocessor {
                 String body = matcher.group(3).trim();
                 List<String> params = parseParams(paramsStr);
                 macros.put(name, new Macro(name, params, body));
+                invalidateMacroPatterns();
             }
             return null;
         }
@@ -192,6 +222,7 @@ public class Preprocessor {
                 String name = matcher.group(1);
                 String value = matcher.group(2) != null ? matcher.group(2).trim() : "";
                 macros.put(name, new Macro(name, value));
+                invalidateMacroPatterns();
             }
             return null;
         }
@@ -201,6 +232,7 @@ public class Preprocessor {
             if (isInActiveBlock()) {
                 String name = matcher.group(1);
                 macros.remove(name);
+                invalidateMacroPatterns();
             }
             return null;
         }
@@ -350,7 +382,7 @@ public class Preprocessor {
 
         expr = expandMacros(expr);
 
-        Matcher comparison = Pattern.compile("(\\w+)\\s*(==|!=|>=|<=|>|<)\\s*(\\w+)").matcher(expr);
+        Matcher comparison = CONDITION_COMPARISON.matcher(expr);
         if (comparison.matches()) {
             String left = comparison.group(1);
             String op = comparison.group(2);
@@ -366,7 +398,7 @@ public class Preprocessor {
             return compareValues(left, op, right);
         }
 
-        Matcher logicalNot = Pattern.compile("!\\s*(\\w+)").matcher(expr);
+        Matcher logicalNot = CONDITION_NOT.matcher(expr);
         if (logicalNot.matches()) {
             String name = logicalNot.group(1);
             return !macros.containsKey(name);
@@ -434,7 +466,50 @@ public class Preprocessor {
 
     private String expandMacros(String line) {
         List<String> stringLiterals = new ArrayList<>();
-        StringBuilder protectedLine = new StringBuilder();
+
+        // 快速路径：整行没有任何引号 → 不可能有字符串字面量需要保护，省掉逐字符扫描
+        String expanded = (line.indexOf('"') < 0 && line.indexOf('\'') < 0)
+                ? line
+                : protectStringLiterals(line, stringLiterals);
+
+        if (expanded.indexOf("__FILE__") >= 0) {
+            String escapedFile = currentFile.replace("\\", "\\\\");
+            expanded = expanded.replace("__FILE__", "\"" + escapedFile + "\"");
+        }
+        if (expanded.indexOf("__LINE__") >= 0) {
+            expanded = expanded.replace("__LINE__", String.valueOf(currentLine));
+        }
+
+        for (Macro macro : macros.values()) {
+            // 行内根本不出现宏名 → 直接跳过，避免无意义的正则匹配
+            if (expanded.indexOf(macro.name) < 0) {
+                continue;
+            }
+            if (macro.isFunction) {
+                expanded = expandFunctionMacro(expanded, macro, stringLiterals);
+            } else if (!macro.body.isEmpty() && !macro.body.equals(macro.name)) {
+                // 预编译 Pattern（宏集合变化时缓存失效），避免每行每宏重复 compile
+                expanded = macroWordPattern(macro.name).matcher(expanded)
+                        .replaceAll(Matcher.quoteReplacement(macro.body));
+            }
+        }
+
+        for (int i = 0; i < stringLiterals.size(); i++) {
+            String placeholder = "__JN_STR_" + i + "__";
+            if (expanded.indexOf(placeholder) >= 0) {
+                expanded = expanded.replace(placeholder, stringLiterals.get(i));
+            }
+        }
+
+        return expanded;
+    }
+
+    /**
+     * 把字符串/字符字面量替换为占位符，返回带占位符的文本。
+     * <p>占位符文本收集到 {@code stringLiterals}，宏展开后再回填。
+     */
+    private String protectStringLiterals(String line, List<String> stringLiterals) {
+        StringBuilder protectedLine = new StringBuilder(line.length());
         boolean inString = false;
         boolean inChar = false;
         boolean inTripleQuote = false;   // 三引号多行字符串模式
@@ -519,31 +594,11 @@ public class Preprocessor {
             protectedLine.append(c);
         }
 
-        String expanded = protectedLine.toString();
-
-        String escapedFile = currentFile.replace("\\", "\\\\");
-        expanded = expanded.replace("__FILE__", "\"" + escapedFile + "\"");
-        expanded = expanded.replace("__LINE__", String.valueOf(currentLine));
-
-        for (Macro macro : macros.values()) {
-            if (macro.isFunction) {
-                expanded = expandFunctionMacro(expanded, macro, stringLiterals);
-            } else if (!macro.body.isEmpty()) {
-                expanded = expanded.replaceAll("\\b" + Pattern.quote(macro.name) + "\\b",
-                    Matcher.quoteReplacement(macro.body));
-            }
-        }
-
-        for (int i = 0; i < stringLiterals.size(); i++) {
-            expanded = expanded.replace("__JN_STR_" + i + "__", stringLiterals.get(i));
-        }
-
-        return expanded;
+        return protectedLine.toString();
     }
 
     private String expandFunctionMacro(String line, Macro macro, List<String> protectedStrings) {
-        Pattern pattern = Pattern.compile("\\b" + Pattern.quote(macro.name) + "\\s*\\(");
-        Matcher matcher = pattern.matcher(line);
+        Matcher matcher = macroCallPattern(macro.name).matcher(line);
         StringBuilder result = new StringBuilder();
         int lastEnd = 0;
 
@@ -674,8 +729,8 @@ public class Preprocessor {
             for (int i = 0; i < macro.params.size() && i < args.size(); i++) {
                 String param = macro.params.get(i);
                 String arg = args.get(i);
-                result = result.replaceAll("\\b" + Pattern.quote(param) + "\\b",
-                    Matcher.quoteReplacement(arg));
+                result = macroWordPattern(param).matcher(result)
+                        .replaceAll(Matcher.quoteReplacement(arg));
             }
         }
 
@@ -684,14 +739,17 @@ public class Preprocessor {
 
     public void define(String name, String value) {
         macros.put(name, new Macro(name, value != null ? value : ""));
+        invalidateMacroPatterns();
     }
 
     public void define(String name) {
         macros.put(name, new Macro(name, ""));
+        invalidateMacroPatterns();
     }
 
     public void undefine(String name) {
         macros.remove(name);
+        invalidateMacroPatterns();
     }
 
     public boolean isDefined(String name) {
@@ -703,6 +761,7 @@ public class Preprocessor {
         macros.put("true", new Macro("true", "true"));
         macros.put("false", new Macro("false", "false"));
         macros.put("__JN__", new Macro("__JN__", "1"));
+        invalidateMacroPatterns();
     }
 
     public Map<String, String> getMacros() {

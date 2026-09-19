@@ -25,8 +25,14 @@ public class ClassResolver {
      * 同一黑名单，resolveClass 先 findClass 后 findClassWithImports 的顺序会导致
      * findClass 先写入 NOT_FOUND，findClassWithImports 直接命中黑名单而永远无法
      * 通过 import 解析。因此这里使用独立的缓存，避免两类查找互相污染。
+     * <p>key 中还包含 import 集合的签名：同一个类名在不同 import 集合下结果可能不同
+     * （新增 import 后原本找不到的简单名可能变得可解析），若不按 import 分区，
+     * 跨上下文会命中过期的"未找到"结论，从而迫使调用方每次 addImport 都清空整个
+     * 黑名单（会造成 forName 次数按 import 条数成倍放大）。
      */
     private static final Map<String, Object> importClassCache = new ConcurrentHashMap<>();
+    /** importClassCache 的容量上限，超过时整体清空，避免无界增长。 */
+    private static final int IMPORT_CACHE_LIMIT = 4096;
     /** 哨兵对象，标记"已查找但不存在"的类（黑名单） */
     private static final Object NOT_FOUND = new Object();
 
@@ -151,16 +157,29 @@ public class ClassResolver {
     }
 
     public static Class<?> findClassWithImports(String className, ClassLoader classLoader, List<String> imports) {
-        Object cached = importClassCache.get(className);
+        String cacheKey = importCacheKey(className, imports);
+        Object cached = importClassCache.get(cacheKey);
         if (cached != null) return cached == NOT_FOUND ? null : (Class<?>) cached;
 
         Class<?> result = findClassWithImportsInternal(className, classLoader, imports);
-        if (result != null) {
-            importClassCache.put(className, result);
-        } else {
-            importClassCache.put(className, NOT_FOUND);
+        if (importClassCache.size() >= IMPORT_CACHE_LIMIT) {
+            importClassCache.clear();
         }
+        importClassCache.put(cacheKey, result != null ? result : NOT_FOUND);
         return result;
+    }
+
+    /**
+     * 构造 import 感知的缓存键：{@code 类名 \0 import 签名}。
+     * <p>签名是 import 列表的精确串联，保证不同 import 集合互不命中。
+     */
+    private static String importCacheKey(String className, List<String> imports) {
+        StringBuilder sb = new StringBuilder(className.length() + 16 * imports.size() + 1);
+        sb.append(className).append('\u0000');
+        for (int i = 0; i < imports.size(); i++) {
+            sb.append(imports.get(i)).append('\u0001');
+        }
+        return sb.toString();
     }
 
     private static Class<?> findClassWithImportsInternal(String className, ClassLoader classLoader, List<String> imports) {
@@ -177,10 +196,7 @@ public class ClassResolver {
         }
 
         if (className.contains(".")) {
-            Class<?> clazz = findClassInternal(className, classLoader);
-            if (clazz != null) return clazz;
-
-            clazz = tryNestedVariants(className, classLoader);
+            Class<?> clazz = findClass(className, classLoader);
             if (clazz != null) return clazz;
         }
 
@@ -201,10 +217,11 @@ public class ClassResolver {
                 fullClassName = importStmt;
             }
 
-            Class<?> clazz = findClassInternal(fullClassName, classLoader);
-            if (clazz != null) return clazz;
-
-            clazz = tryNestedVariants(fullClassName, classLoader);
+            // 注意：这里刻意走带缓存的 findClass（key = 展开后的全限定名），而不是裸的
+            // findClassInternal。展开名与 import 集合无关，是"该全限定名是否存在"的纯事实，
+            // 因此可以全局缓存：新增 import 时只需探测新增的前缀，不必对所有旧前缀重试，
+            // 否则每 addImport 一次就要把全部前缀重新 forName 一遍。
+            Class<?> clazz = findClass(fullClassName, classLoader);
             if (clazz != null) return clazz;
         }
         return null;
@@ -213,14 +230,27 @@ public class ClassResolver {
     private static Class<?> tryNestedVariants(String dottedName, ClassLoader loader) {
         char[] chars = dottedName.toCharArray();
         for (int i = chars.length - 1; i > 0; i--) {
-            if (chars[i] == '.') {
-                chars[i] = '$';
-                Class<?> clazz = findClassInternal(new String(chars), loader);
-                if (clazz != null) return clazz;
-                chars[i] = '.';
+            if (chars[i] != '.') continue;
+            // 启发式前置判断：$ 变体只对"外部类$嵌套类"有意义。
+            // 只有满足以下之一才值得尝试，否则每次都要白白 Class.forName 一次：
+            //   1) dot 之后的部分首字母大写（嵌套类名惯例，如 Map.Entry / java.util.Map.Entry）；
+            //   2) dot 之前的部分本身就是一个已解析的具体类（如 Map.Entry，Map 已 import）。
+            // 普通的"变量.成员"（player.get）与"包名.短标识符"（java.lang.enemies）都不会触发。
+            if (!Character.isUpperCase(chars[i + 1])
+                    && !isResolvableClassName(dottedName.substring(0, i), loader)) {
+                continue;
             }
+            chars[i] = '$';
+            Class<?> clazz = findClassInternal(new String(chars), loader);
+            if (clazz != null) return clazz;
+            chars[i] = '.';
         }
         return null;
+    }
+
+    /** 前缀是否解析为已知类（走缓存，避免重复探测）。 */
+    private static boolean isResolvableClassName(String name, ClassLoader loader) {
+        return findClass(name, loader) != null;
     }
 
     protected static Class<?> findClassInternal(String className, ClassLoader preferredLoader) {

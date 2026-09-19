@@ -60,18 +60,22 @@ public class CodeFormatter {
         if (node instanceof ParameterNode n) return formatParam(n);
         if (node instanceof PipelineNode n) return formatPipeline(n, indent);
         if (node instanceof ReturnNode n) return formatReturn(n, indent);
+        if (node instanceof YieldNode n) return "yield " + format(n.getValue(), indent);
         if (node instanceof SafeFieldAccessNode n) return formatSafeFieldAccess(n, indent);
         if (node instanceof SafeMethodCallNode n) return formatSafeMethodCall(n, indent);
         if (node instanceof SuperMethodCallNode n) return formatSuperMethodCall(n, indent);
         if (node instanceof SwitchNode n) return formatSwitch(n, indent);
         if (node instanceof TernaryNode n) return formatTernary(n, indent);
         if (node instanceof ThrowNode n) return formatThrow(n, indent);
+        if (node instanceof AssertNode n) return formatAssert(n, indent);
+        if (node instanceof SynchronizedNode n) return formatSynchronized(n, indent);
         if (node instanceof TryNode n) return formatTry(n, indent);
         if (node instanceof UnaryOpNode n) return formatUnaryOp(n, indent);
         if (node instanceof UsingAliasNode n) return formatUsingAlias(n);
         if (node instanceof UsingStaticNode n) return "using static " + n.getClassName() + ";";
         if (node instanceof VarDeclNode n) return formatVarDecl(n, indent);
         if (node instanceof VariableNode n) return n.getName();
+        if (node instanceof NameRefNode n) return n.getName();
         if (node instanceof WhileNode n) return formatWhile(n, indent);
 
         return node.toString();
@@ -333,6 +337,19 @@ public class CodeFormatter {
         return "throw " + format(n.getExpression(), indent) + ";";
     }
 
+    private static String formatAssert(AssertNode n, int indent) {
+        String code = "assert " + format(n.getCondition(), indent);
+        if (n.hasMessage()) {
+            code += " : " + format(n.getMessage(), indent);
+        }
+        return code + ";";
+    }
+
+    private static String formatSynchronized(SynchronizedNode n, int indent) {
+        return "synchronized (" + format(n.getLock(), indent) + ") "
+                + format(n.getBody(), indent);
+    }
+
     private static String formatReturn(ReturnNode n, int indent) {
         if (n.getValue() != null) {
             return "return " + format(n.getValue(), indent) + ";";
@@ -421,10 +438,14 @@ public class CodeFormatter {
         sb.append(n.getElementType().getSimpleName());
         if (!n.getSizes().isEmpty()) {
             for (ASTNode size : n.getSizes()) {
-                sb.append("[").append(format(size, indent)).append("]");
+                // 空维度（new Type[] {…} 里的 []）为 null
+                sb.append("[").append(size == null ? "" : format(size, indent)).append("]");
             }
         } else if (n.getSize() != null) {
             sb.append("[").append(format(n.getSize(), indent)).append("]");
+        }
+        if (n.getInitializer() != null) {
+            sb.append(" ").append(format(n.getInitializer(), indent));
         }
         return sb.toString();
     }
@@ -514,7 +535,9 @@ public class CodeFormatter {
                 sb.append(mods).append(" ");
             }
         }
-        if (n.isInterface()) {
+        if (n.isRecord()) {
+            sb.append("record ");
+        } else if (n.isInterface()) {
             sb.append("interface ");
         } else {
             sb.append("class ");
@@ -532,6 +555,15 @@ public class CodeFormatter {
             }
             sb.append(">");
         }
+        if (n.isRecord()) {
+            sb.append("(");
+            for (int i = 0; i < n.getRecordComponents().size(); i++) {
+                if (i > 0) sb.append(", ");
+                ParameterNode component = n.getRecordComponents().get(i);
+                sb.append(formatClassRef(component.getType())).append(" ").append(component.getParameterName());
+            }
+            sb.append(")");
+        }
         if (n.getSuperClass() != null) {
             sb.append(" extends ").append(n.getSuperClass().getOriginalTypeName());
         }
@@ -540,6 +572,13 @@ public class CodeFormatter {
             for (int i = 0; i < n.getInterfaces().size(); i++) {
                 if (i > 0) sb.append(", ");
                 sb.append(n.getInterfaces().get(i).getOriginalTypeName());
+            }
+        }
+        if (!n.getPermittedSubclasses().isEmpty()) {
+            sb.append(" permits ");
+            for (int i = 0; i < n.getPermittedSubclasses().size(); i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(n.getPermittedSubclasses().get(i).getOriginalTypeName());
             }
         }
         sb.append(" {\n");

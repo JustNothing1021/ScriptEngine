@@ -5,7 +5,9 @@ import com.justnothing.engine.builtins.BuiltinRegistry;
 import com.justnothing.engine.util.DefaultClassFinder;
 import com.justnothing.engine.ast.ASTNode;
 import com.justnothing.engine.ast.GenericType;
+import com.justnothing.engine.ast.SourceLocation;
 import com.justnothing.engine.ast.nodes.ClassDeclarationNode;
+import com.justnothing.engine.ast.nodes.NameRefNode;
 import com.justnothing.engine.codegen.DynamicClassGenerator;
 import com.justnothing.engine.exception.ErrorCode;
 
@@ -41,6 +43,15 @@ public class ParseContext {
 
     /** 数组类型缓存：避免 getRawType() 每次都 Array.newInstance 反射创建 */
     private final Map<String, Class<?>> arrayTypeCache = new HashMap<>();
+
+    /**
+     * 本上下文内已确认"解析不到/不是类名"的名字集合。
+     * <p>避免同一个名字（尤其是变量名被当作类名探测）被反复逐 import 前缀重试 —— 每次重试
+     * 都要对 7 个默认 import 前缀各做一次 Class.forName。import / 类型别名 / 自定义类声明
+     * 发生变化时清空（这些变化可能让原本解析不到的名字变得可解析）。
+     * 生命周期与 ParseContext 相同，不会跨上下文增长。
+     */
+    private final Set<String> unresolvedClassNames = new HashSet<>();
 
     // ==================== 作用域 / 符号表 ====================
 
@@ -81,8 +92,128 @@ public class ParseContext {
     private boolean strictMode = true;
     private DynamicClassGenerator codegen;
 
+    // ==================== 拆分探针（默认全关，仅用于测量） ====================
+
+    /**
+     * 解析阶段标记：探针开关只作用于解析期调用者。
+     * <p>
+     * 为什么需要它：{@link #resolveClass} 同时被解析器和运行期 {@code Evaluator} 复用
+     * （见 {@code Evaluator#findClass}）。若不区分阶段，"关掉类解析"会把运行期一起打死，
+     * 测出来的失败里就混进一堆与解析期无关的噪音，而我们需要的是"解析期到底扛了多少语义"
+     * 这一个干净的读数。进出由 {@link Parser#parse()} 维护，用 ThreadLocal 避免跨线程污染。
+     * </p>
+     */
+    private static final ThreadLocal<int[]> parsePhase = ThreadLocal.withInitial(() -> new int[1]);
+
+    public static void enterParsePhase() {
+        parsePhase.get()[0]++;
+    }
+
+    public static void exitParsePhase() {
+        int[] depth = parsePhase.get();
+        if (depth[0] > 0) depth[0]--;
+    }
+
+    /** 当前是否处于解析阶段调用栈内。 */
+    public static boolean isInParsePhase() {
+        return parsePhase.get()[0] > 0;
+    }
+
+    /** 探针：跳过类解析（{@link #resolveClass} 直接返回 null，不触发 codegen）。 */
+    private static final boolean PROBE_SKIP_CLASS_RESOLUTION =
+            Boolean.getBoolean("engine.parser.noClassResolution");
+
+    /** 探针：跳过类型标注（{@link #setType} 不写入类型标注表，推断随之整体缺席）。 */
+    private static final boolean PROBE_SKIP_TYPE_ANNOTATION =
+            Boolean.getBoolean("engine.parser.noTypeAnnotation");
+
+    /** 探针：跳过语义校验（{@link #isStrictMode} 恒为 false，未知类型/未知符号静默放行）。 */
+    private static final boolean PROBE_SKIP_SEMANTIC_CHECKS =
+            Boolean.getBoolean("engine.parser.noSemanticChecks");
+
+    /**
+     * 探针作用范围：缺省 {@code parse} 只作用解析期；{@code all} 连运行期一起退化（对照组）。
+     */
+    private static final boolean PROBE_ALL_SCOPE =
+            "all".equalsIgnoreCase(System.getProperty("engine.parser.probeScope", "parse"));
+
+    private static boolean probeActive() {
+        return PROBE_ALL_SCOPE || isInParsePhase();
+    }
+
+    /** 探针：本次调用是否跳过类解析。 */
+    public static boolean probeSkipsClassResolution() {
+        return PROBE_SKIP_CLASS_RESOLUTION && probeActive();
+    }
+
+    /** 探针：本次调用是否跳过类型标注。 */
+    public static boolean probeSkipsTypeAnnotation() {
+        return PROBE_SKIP_TYPE_ANNOTATION && probeActive();
+    }
+
+    /** 探针：本次调用是否跳过语义校验。 */
+    public static boolean probeSkipsSemanticChecks() {
+        return PROBE_SKIP_SEMANTIC_CHECKS && probeActive();
+    }
+
+    // ==================== 泛型闭合符拆分（>> / >>>） ====================
+
+    /** 嵌套泛型闭合时从 {@code >>} / {@code >>>} 里预取、尚未被外层消费的 {@code >} 数量。 */
+    private int pendingAngleBrackets;
+
+    /**
+     * 是否还有从 {@code >>} / {@code >>>} 里预取的 {@code >} 可以消费；有则消费掉一个。
+     * <p>
+     * Lexer 会把 {@code >>} 识别成右移操作符，但 Java 允许用它代替嵌套泛型的 {@code > >}
+     * （如 {@code List<List<String>>}），所以类型解析侧要把多出来的 {@code >} 记下来还外层。
+     * </p>
+     * <p>
+     * <b>为什么这个状态在 ParseContext 而不是某个解析器实例</b>：一个类型声明可能跨多个 parser
+     * 实例解析 —— 例如 {@code class G<T extends Comparable<T>>}，类声明的类型参数表由
+     * ClassBodyParser 解析，上界 {@code Comparable<T>} 又交给一个新的 TypeParser。内层从
+     * {@code >>} 里多吃掉的那个 {@code >} 必须让外层看得见，否则外层会误报
+     * "Expected '>' after type parameter list"。
+     * </p>
+     */
+    public boolean consumePendingAngleBracket() {
+        if (pendingAngleBrackets > 0) {
+            pendingAngleBrackets--;
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * 记录从 {@code >>} / {@code >>>} 中预取到的 {@code >} 数量。
+     *
+     * @param count {@code >>} 记 1，{@code >>>} 记 2
+     */
+    public void addPendingAngleBrackets(int count) {
+        pendingAngleBrackets += count;
+    }
+
+    /**
+     * 清空预存的 {@code >}。
+     * <p>解析入口与错误恢复时调用：被放弃的那段代码里若正好有个嵌套泛型，剩下的
+     * {@code >} 不该留给后面的语句。</p>
+     */
+    public void clearPendingAngleBrackets() {
+        pendingAngleBrackets = 0;
+    }
+
+    /** 当前预存的 {@code >} 数量（供回溯时快照/还原）。 */
+    public int getPendingAngleBrackets() {
+        return pendingAngleBrackets;
+    }
+
+    /** 还原预存的 {@code >} 数量（供回溯时快照/还原）。 */
+    public void setPendingAngleBrackets(int count) {
+        pendingAngleBrackets = count;
+    }
+
     public void setCodeGenerator(DynamicClassGenerator codegen) {
         this.codegen = codegen;
+        unresolvedClassNames.clear();
     }
 
     public DynamicClassGenerator getCodeGenerator() {
@@ -110,7 +241,8 @@ public class ParseContext {
     // ==================== 严格模式 ====================
 
     public boolean isStrictMode() {
-        return strictMode;
+        // 探针：语义校验全部静默放行
+        return !probeSkipsSemanticChecks() && strictMode;
     }
 
     /** 设置严格模式（必须在解析前调用）。 */
@@ -137,10 +269,12 @@ public class ParseContext {
     public void addImport(String importStmt) {
         if (!imports.contains(importStmt)) {
             imports.add(importStmt);
-            // 新增 import 后，之前找不到的类可能通过新 import 找到了，清空黑名单
-            if (classFinder != null) {
-                classFinder.clearBlacklist();
-            }
+            // 新增 import 后，之前找不到的类可能通过新 import 找到了。
+            // 这里不再调用 classFinder.clearBlacklist()：ClassResolver 的 import 查找缓存以
+            // "类名 + import 集合签名" 为 key，新 import 会自动落入新的缓存分区，旧分区的
+            // "未找到" 结论不会被复用；而全量清空黑名单会让每个 import 都触发一次全量重查，
+            // 使 Class.forName 次数按 import 条数成倍放大（实测 20 条 import 放大 20 倍）。
+            unresolvedClassNames.clear();
         }
     }
 
@@ -152,6 +286,7 @@ public class ParseContext {
 
     public void clearImports() {
         imports.clear();
+        unresolvedClassNames.clear();
     }
 
     // ==================== 类型别名 ====================
@@ -162,6 +297,7 @@ public class ParseContext {
 
     public void addTypeAlias(String aliasName, String fullClassName) {
         typeAliases.put(aliasName, fullClassName);
+        unresolvedClassNames.clear();
     }
 
     /**
@@ -189,6 +325,7 @@ public class ParseContext {
 
     public void declareClass(String className) {
         declaredClassNames.add(className);
+        unresolvedClassNames.clear();
     }
 
     /**
@@ -198,6 +335,7 @@ public class ParseContext {
     public void declareClass(ClassDeclarationNode classDecl) {
         declaredClassNames.add(classDecl.getClassName());
         classDeclarations.put(classDecl.getClassName(), classDecl);
+        unresolvedClassNames.clear();
     }
 
     public boolean isClassDeclared(String className) {
@@ -267,6 +405,7 @@ public class ParseContext {
 
     public void setClassLoader(ClassLoader classLoader) {
         this.classLoader = classLoader;
+        unresolvedClassNames.clear();
     }
 
     public IClassFinder getClassFinder() {
@@ -275,6 +414,7 @@ public class ParseContext {
 
     public void setClassFinder(IClassFinder classFinder) {
         this.classFinder = classFinder;
+        unresolvedClassNames.clear();
     }
 
     /**
@@ -284,6 +424,11 @@ public class ParseContext {
      * @return 找到的 Class 对象，找不到返回 null
      */
     public Class<?> resolveClass(String className) {
+        // 探针：不查类，让调用方拿到 null 走各自的 fallback
+        if (probeSkipsClassResolution()) return null;
+
+        if (unresolvedClassNames.contains(className)) return null;
+
         String resolved = resolveTypeAlias(className);
         String actualName = (resolved != null) ? resolved : className;
 
@@ -310,9 +455,103 @@ public class ParseContext {
             // codegen == null 时不报错，返回 null 让调用方处理（解析器会 fallback）
         }
 
+        if (result == null) {
+            unresolvedClassNames.add(className);
+        }
         return result;
     }
 
+
+    // ==================== 当前位置 ====================
+
+    /**
+     * 最近消费的 token 位置。
+     * <p>
+     * 由 {@link BaseParser#advance()} 维护，用于没有 token 上下文的语义检查
+     * （如重复声明检测）生成带位置的错误信息。
+     * </p>
+     */
+    private SourceLocation currentLocation;
+
+    /** 记录最近消费的 token 位置。 */
+    public void setCurrentLocation(SourceLocation location) {
+        this.currentLocation = location;
+    }
+
+    /** 最近消费的 token 位置（尚未消费任何 token 时为 null）。 */
+    public SourceLocation getCurrentLocation() {
+        return currentLocation;
+    }
+
+    // ==================== 错误恢复 ====================
+
+    /**
+     * 语句级错误恢复期间收集到的错误。
+     * <p>
+     * 遇到错误时跳到下一个语句同步点继续解析，把错误累积到这里，
+     * 使一次解析能够报告多处问题（而不是首个错误就中止）。
+     * </p>
+     */
+    private final List<CythavaParseException> parseErrors = new ArrayList<>();
+
+    /**
+     * 是否启用语句级错误恢复。
+     * <p>
+     * 宽容解析路径（如匿名类成员/方法体）依赖"出错即抛异常并回退"的行为，
+     * 需要临时关闭恢复。
+     * </p>
+     */
+    private boolean errorRecoveryEnabled = true;
+
+    /** 记录一个已恢复的语句级错误。 */
+    public void reportError(CythavaParseException error) {
+        parseErrors.add(error);
+    }
+
+    /** 本次解析收集到的全部语句级错误（只读）。 */
+    public List<CythavaParseException> getParseErrors() {
+        return Collections.unmodifiableList(parseErrors);
+    }
+
+    /** 清空错误列表（每次顶层解析开始时调用）。 */
+    public void clearParseErrors() {
+        parseErrors.clear();
+    }
+
+    // ==================== 值位置的未定名引用（link 前的待判定名单） ====================
+
+    /**
+     * 解析期产出、身份尚未判定的名字引用。
+     * <p>
+     * 解析器遇到裸名字时不该去查类（那是 link 层的事），只登记在这里；等整棵 AST 建好、
+     * 类声明与符号表都齐了，再由 link 阶段统一判定。顺带的好处是"后声明的类"也能被引用到：
+     * 解析到 {@code Foo.bar} 时 {@code class Foo} 可能还没被登记。
+     * </p>
+     */
+    private final List<NameRefNode> pendingNameRefs = new ArrayList<>();
+
+    /** 登记一个待判定的名字引用。 */
+    public void addNameRef(NameRefNode node) {
+        pendingNameRefs.add(node);
+    }
+
+    /** 本次解析登记的待判定名字引用（只读）。 */
+    public List<NameRefNode> getNameRefs() {
+        return Collections.unmodifiableList(pendingNameRefs);
+    }
+
+    /** 清空待判定名字引用（每次顶层解析开始时调用）。 */
+    public void clearNameRefs() {
+        pendingNameRefs.clear();
+    }
+
+    public boolean isErrorRecoveryEnabled() {
+        return errorRecoveryEnabled;
+    }
+
+    public void setErrorRecoveryEnabled(boolean enabled) {
+        this.errorRecoveryEnabled = enabled;
+    }
 
     // ==================== 作用域管理 ====================
 
@@ -351,7 +590,7 @@ public class ParseContext {
         Scope currentScope = scopeStack.peek();
         if (currentScope.variables.containsKey(name)) {
             throw new CythavaParseException(
-                    "Variable '" + name + "' is already declared in the current scope", null, ErrorCode.SCOPE_VARIABLE_ALREADY_DECLARED, true);
+                    "Variable '" + name + "' is already declared in the current scope", getCurrentLocation(), ErrorCode.SCOPE_VARIABLE_ALREADY_DECLARED, true);
         }
         currentScope.variables.put(name, new VariableSymbol(name, isFinal));
     }
@@ -399,7 +638,7 @@ public class ParseContext {
         Scope currentScope = scopeStack.peek();
         if (currentScope.variables.containsKey(name)) {
             throw new CythavaParseException(
-                    "Variable '" + name + "' is already declared in the current scope", null, ErrorCode.SCOPE_VARIABLE_ALREADY_DECLARED, true);
+                    "Variable '" + name + "' is already declared in the current scope", getCurrentLocation(), ErrorCode.SCOPE_VARIABLE_ALREADY_DECLARED, true);
         }
         currentScope.variables.put(name, new VariableSymbol(name, isFinal, declaredType));
     }
@@ -505,10 +744,21 @@ public class ParseContext {
         if (declaredClassNames.contains(name)) {
             return true;
         }
+        // 内置函数名不是类名：避免 println/print 等被逐 import 前缀当作类名探测
+        if (isBuiltinFunction(name)) {
+            return false;
+        }
+        if (unresolvedClassNames.contains(name)) {
+            return false;
+        }
         // 尝试通过 import/classfinder 解析
         String resolved = resolveTypeAlias(name);
         String actualName = (resolved != null) ? resolved : name;
-        return classFinder.findClassWithImports(actualName, classLoader, imports) != null;
+        if (classFinder.findClassWithImports(actualName, classLoader, imports) != null) {
+            return true;
+        }
+        unresolvedClassNames.add(name);
+        return false;
     }
 
     // ==================== 类型标注 ====================
@@ -520,6 +770,8 @@ public class ParseContext {
      * @param type 该节点的 JType 类型
      */
     public void setType(ASTNode node, JType type) {
+        // 探针：类型标注整体缺席
+        if (probeSkipsTypeAnnotation()) return;
         if (node != null && type != null) {
             typeMap.put(node, type);
         }

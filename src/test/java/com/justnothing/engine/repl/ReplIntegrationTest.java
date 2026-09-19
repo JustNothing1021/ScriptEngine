@@ -756,6 +756,38 @@ public class ReplIntegrationTest {
         assertTrue("Raw HashMap.new() should have no type arguments", type.getTypeArguments().isEmpty());
     }
 
+    // ==================== 泛型方法调用 obj.<TypeArgs>method() ====================
+
+    @Test
+    public void testGenericMethodCall_withTypeArgs() throws Exception {
+        // obj.<String>m() 是 Java 的写法：闭合符后直接跟方法名，没有第二个点。
+        // 修复前：解析器死等闭合符后面的 '.' → 回退 → 报 "Expected member name after '.'"
+        parseSingle("java.util.ArrayList items = new java.util.ArrayList();");
+        parseSingle("String x = \"a\";");
+        ASTNode node = parseSingle("items.<String>add(x);");
+        MethodCallNode mc = assertNodeType(MethodCallNode.class, node);
+        assertEquals("add", mc.getMethodName());
+        assertEquals(1, mc.getArguments().size());
+    }
+
+    @Test
+    public void testGenericMethodCall_nestedTypeArgsClosedByShift() throws Exception {
+        // 嵌套泛型用 >> 闭合：泛型实参解析侧要吃掉一个 >、还一个给外层
+        parseSingle("java.util.List m = new java.util.ArrayList();");
+        parseSingle("Object x = null;");
+        ASTNode node = parseSingle("m.<List<List<String>>>add(x);");
+        MethodCallNode mc = assertNodeType(MethodCallNode.class, node);
+        assertEquals("add", mc.getMethodName());
+    }
+
+    @Test
+    public void testGenericConstructor_dotNewStillWorksAfterMakingDotOptional() throws Exception {
+        // obj.<T>.new() 与 obj.<T>m() 共用同一段解析，前者不能因为点变可选而退化
+        ASTNode node = parseSingle("java.util.HashMap.<String, Integer>.new()");
+        ConstructorCallNode cc = assertNodeType(ConstructorCallNode.class, node);
+        assertEquals(2, cc.getType().getTypeArguments().size());
+    }
+
     // ==================== 泛型方法引用 Class::<TypeArgs>method ====================
 
     @Test
@@ -859,5 +891,44 @@ public class ReplIntegrationTest {
         context.setStrictMode(false);
         List<ASTNode> nodes = parse("enum Color { RED, GREEN, BLUE }");
         assertEquals("enum should parse", 1, nodes.size());
+    }
+
+    // ==================== @StaticAssert 注解形式 ====================
+
+    @Test
+    public void testStaticAssertAnnotation_onClassDeclaration() throws Exception {
+        // 编译期语法糖：判定通过后不产生 AnnotationNode，也不影响后续声明解析
+        List<ASTNode> nodes = parse("@StaticAssert(1 + 1 == 2) class Annotated { int v = 1; }");
+        assertEquals(1, nodes.size());
+        ClassDeclarationNode decl = assertNodeType(ClassDeclarationNode.class, nodes.get(0));
+        assertEquals("Annotated", decl.getClassName());
+    }
+
+    @Test
+    public void testStaticAssertAnnotation_onClassMember() throws Exception {
+        List<ASTNode> nodes = parse("class Holder { @StaticAssert(4 > 3, \"sanity\") int v = 1; }");
+        ClassDeclarationNode decl = assertNodeType(ClassDeclarationNode.class, nodes.get(0));
+        assertEquals(1, decl.getFields().size());
+        assertTrue("@StaticAssert 不应留下注解节点",
+                decl.getFields().get(0).getAnnotations().isEmpty());
+    }
+
+    @Test
+    public void testStaticAssertAnnotation_falseConstantFails() {
+        assertParseError("@StaticAssert(1 > 2) class Bad { }", "条件不成立");
+    }
+
+    @Test
+    public void testStaticAssertAnnotation_nonConstantFails() {
+        assertParseError("@StaticAssert(x > 0) class Bad { }", "编译期常量表达式");
+    }
+
+    @Test
+    public void testStaticAssertAnnotation_doesNotShadowOtherAnnotations() throws Exception {
+        // 普通注解仍照常产出 AnnotationNode，不被语法糖拦截
+        List<ASTNode> nodes = parse("class Mixed { @Deprecated @StaticAssert(1 < 2) int v = 1; }");
+        ClassDeclarationNode decl = assertNodeType(ClassDeclarationNode.class, nodes.get(0));
+        assertEquals(1, decl.getFields().get(0).getAnnotations().size());
+        assertEquals("Deprecated", decl.getFields().get(0).getAnnotations().get(0).getAnnotationName());
     }
 }

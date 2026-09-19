@@ -23,6 +23,7 @@ import com.justnothing.engine.preprocessor.Preprocessor;
 import com.justnothing.engine.security.IPermissionChecker;
 import com.justnothing.engine.security.SandboxConfig;
 import com.justnothing.engine.security.SecurityGate;
+import com.justnothing.engine.util.CodeFormatter;
 import com.justnothing.engine.util.CompositeClassLoader;
 
 import java.util.ArrayList;
@@ -44,15 +45,17 @@ public class ScriptRunner {
     private boolean enablePreprocessor = true;
 
     /**
-     * REPL 模式开关。
-     * <p>默认 false：每次 executeWithResult / executeNodes 前都会 resetParseContext，
-     * 保证多次执行互相隔离（脚本模式语义）。
-     * <br>设为 true 时保留同一个 ParseContext，import / 变量 / 类声明可跨行生效，
-     * 供 sinteractive 等交互式 REPL 使用（与 EvalRepl 复用 ParseContext 的行为一致）。
+     * REPL 模式开关（跨 execute 的会话持久化开关）。
+     * <p>默认 false：每次 executeWithResult / executeNodes 前都会 {@link #resetSession()}，
+     * 即解析上下文与运行期变量一起清掉，保证多次执行互相隔离（脚本模式语义）。
+     * <br>设为 true 时两个上下文都保留，import / 变量 / 类声明可跨行生效，
+     * 供 sinteractive 等交互式 REPL 使用。
+     * <p>两个上下文必须同进同退：只重置其一会让解析器与运行期对"哪些名字已声明"产生分歧，
+     * 表现为同一段代码时而报 {@code Cannot find symbol}、时而报 {@code Undefined variable}。
      */
     private boolean replMode = false;
 
-    /** 是否处于 REPL 模式（保留 ParseContext 状态）。 */
+    /** 是否处于 REPL 模式（跨 execute 保留解析上下文与运行期变量）。 */
     public boolean isReplMode() {
         return replMode;
     }
@@ -143,14 +146,26 @@ public class ScriptRunner {
     }
 
     public Object executeWithResult(String code, String sourceFileName) {
+        long startNanos = timingLog ? System.nanoTime() : 0L;
+        long mark = startNanos;
         try {
             if (!replMode) {
-                resetParseContext();
+                resetSession();
             }
             String processedCode = preprocess(code);
+            long tPreprocess = timingLog ? System.nanoTime() - mark : 0L;
+            mark = timingLog ? System.nanoTime() : 0L;
+
             Lexer lexer = new Lexer(processedCode, sourceFileName);
-            Parser parser = new Parser(lexer.tokenize(), parseContext, sourceFileName);
+            var tokens = lexer.tokenize();
+            long tLex = timingLog ? System.nanoTime() - mark : 0L;
+            mark = timingLog ? System.nanoTime() : 0L;
+
+            Parser parser = new Parser(tokens, parseContext, sourceFileName);
             List<ASTNode> nodes = parser.parse();
+            long tParse = timingLog ? System.nanoTime() - mark : 0L;
+            mark = timingLog ? System.nanoTime() : 0L;
+            printASTIfEnabled(nodes);
 
             for (ASTNode node : nodes) {
                 if (node instanceof ClassDeclarationNode classDecl) {
@@ -162,11 +177,18 @@ public class ScriptRunner {
                     }
                 }
             }
+            long tClassgen = timingLog ? System.nanoTime() - mark : 0L;
+            mark = timingLog ? System.nanoTime() : 0L;
 
             CustomClassExecutor.setContext(evalContext, parseContext);
             Evaluator evaluator = new Evaluator(evalContext, parseContext);
             List<Value> results = evaluator.evaluateAll(nodes);
             CustomClassExecutor.clearContext();
+            long tEval = timingLog ? System.nanoTime() - mark : 0L;
+
+            if (timingLog) {
+                logTiming(tPreprocess, tLex, tParse, tClassgen, tEval, System.nanoTime() - startNanos);
+            }
 
             if (results.isEmpty()) return null;
             Value last = results.get(results.size() - 1);
@@ -233,7 +255,7 @@ public class ScriptRunner {
             if (out != null) evalContext.setOutput(out);
 
             if (!replMode) {
-                resetParseContext();
+                resetSession();
             }
 
             for (ASTNode node : nodes) {
@@ -279,6 +301,20 @@ public class ScriptRunner {
 
     // ==================== Parsing ====================
 
+    /**
+     * 重置整个会话：解析上下文与运行期变量一起清掉。
+     * <p>
+     * 脚本模式（{@code replMode=false}）下每次执行前调用。两个上下文必须一起重置 ——
+     * 只清其一会让解析器与运行期对"哪些名字已声明"产生分歧：解析器忘了会报
+     * {@code Cannot find symbol}，运行期忘了会报 {@code Undefined variable}，
+     * 同一段代码因此在不同次 execute 之间表现不一致。
+     * </p>
+     */
+    public void resetSession() {
+        resetParseContext();
+        evalContext.getVariables().clear();
+    }
+
     public void resetParseContext() {
         IClassFinder oldFinder = this.parseContext != null ? this.parseContext.getClassFinder() : null;
         this.parseContext = new ParseContext(this.classLoader);
@@ -286,6 +322,12 @@ public class ScriptRunner {
         this.parseContext.setOperatorRegistry(this.operatorRegistry);
         if (oldFinder != null) {
             this.parseContext.setClassFinder(oldFinder);
+        }
+        if (this.codegen != null) {
+            // 必须一并接上类生成器并共享类声明表：否则脚本内声明的类无法在后续语句中解析
+            // （resolveClass 会因 codegen == null 而返回 null，报 "Unknown type"）
+            this.parseContext.setCodeGenerator(this.codegen);
+            this.codegen.setClassDeclarations(this.parseContext.getClassDeclarations());
         }
     }
 
@@ -300,6 +342,7 @@ public class ScriptRunner {
             Lexer lexer = new Lexer(processedCode, sourceFileName);
             Parser parser = new Parser(lexer.tokenize(), parseContext, sourceFileName);
             List<ASTNode> nodes = parser.parse();
+            printASTIfEnabled(nodes);
             return nodes != null ? nodes : new ArrayList<>();
         } catch (CythavaParseException e) {
             throw new RuntimeException("Parse error: " + e.getMessage(), e);
@@ -334,12 +377,19 @@ public class ScriptRunner {
         return evalContext.hasVariable(name);
     }
 
+    /**
+     * 删除一个变量。解析器与运行期两侧一起删，避免解析器仍记得该名字
+     * 而运行期已找不到（后续读取会报 {@code Undefined variable} 而非 {@code Cannot find symbol}）。
+     */
     public void deleteVariable(String name) {
         evalContext.getVariables().remove(name);
+        parseContext.undeclareVariable(name);
     }
 
+    /** 清空所有变量。解析器与运行期两侧一起清。 */
     public void clearVariables() {
         evalContext.getVariables().clear();
+        parseContext.clearAllVariables();
     }
 
     public Map<String, Object> getAllVariablesAsObject() {
@@ -506,6 +556,38 @@ public class ScriptRunner {
     }
 
     public void setPrintAST(boolean printAST) {
-        this.printASTMode = printASTMode;
+        this.printASTMode = printAST;
+    }
+
+    /** AST 打印模式下，将解析结果输出到 outputHandler（供调试/验证 Parser 输出）。 */
+    private void printASTIfEnabled(List<ASTNode> nodes) {
+        if (!printASTMode || nodes == null) {
+            return;
+        }
+        for (ASTNode node : nodes) {
+            outputHandler.println(CodeFormatter.format(node));
+        }
+    }
+
+    /** 是否输出分阶段耗时日志（诊断解析/求值性能用）。 */
+    private boolean timingLog = false;
+
+    public boolean isTimingLog() {
+        return timingLog;
+    }
+
+    /** 开启后，每次执行结束会向 errorHandler 输出各阶段耗时。 */
+    public void setTimingLog(boolean timingLog) {
+        this.timingLog = timingLog;
+    }
+
+    /** 向 errorHandler 输出一行分阶段耗时（毫秒）。 */
+    private void logTiming(long preprocessNanos, long lexNanos, long parseNanos,
+                           long classgenNanos, long evalNanos, long totalNanos) {
+        errorHandler.println(String.format(
+            "[engine] 耗时: 预处理 %.1fms | 词法 %.1fms | 解析 %.1fms | 类生成 %.1fms | 求值 %.1fms | 总计 %.1fms",
+            preprocessNanos / 1e6, lexNanos / 1e6, parseNanos / 1e6,
+            classgenNanos / 1e6, evalNanos / 1e6, totalNanos / 1e6));
+        errorHandler.flush();
     }
 }

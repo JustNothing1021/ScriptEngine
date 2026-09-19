@@ -35,15 +35,30 @@ public class Keywords {
     public static final String FINALLY = "finally";
     public static final String THROW = "throw";
     public static final String ASSERT = "assert";
+    public static final String STATIC_ASSERT = "static_assert";
     public static final String GOTO = "goto";
     public static final String USING = "using";
     public static final String ASYNC = "async";
     public static final String AWAIT = "await";
+    /** 受限标识符：只在 {@code yield expr;} 语句位置当关键字，故不列入词法关键字表。 */
+    public static final String YIELD = "yield";
+    /**
+     * 上下文关键字：只在类型声明位置有意义（后面紧跟标识符与 {@code (} / {@code <}），
+     * 平时仍是普通标识符，故不列入词法关键字表。
+     */
+    public static final String RECORD = "record";
+    public static final String SEALED = "sealed";
+    public static final String PERMITS = "permits";
+    /** {@code non-sealed} 在词法上是 {@code non} {@code -} {@code sealed} 三个 token。 */
+    public static final String NON = "non";
     public static final String SUPER = "super";
     public static final String THIS = "this";
     public static final String ABSTRACT = "abstract";
     public static final String NATIVE = "native";
     public static final String SYNCHRONIZED = "synchronized";
+    public static final String VOLATILE = "volatile";
+    public static final String TRANSIENT = "transient";
+    public static final String STRICTFP = "strictfp";
     public static final String PUBLIC = "public";
     public static final String PRIVATE = "private";
     public static final String PROTECTED = "protected";

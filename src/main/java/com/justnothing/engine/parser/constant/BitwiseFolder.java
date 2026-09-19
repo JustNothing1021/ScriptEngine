@@ -12,9 +12,9 @@ final class BitwiseFolder {
 
     static Object fold(BinaryOpNode.Operator op, Object a, Object b) {
         return switch (op) {
-            case BITWISE_AND  -> NumericUtils.applyLong(a, b, (x, y) -> x & y);
-            case BITWISE_OR   -> NumericUtils.applyLong(a, b, (x, y) -> x | y);
-            case BITWISE_XOR  -> NumericUtils.applyLong(a, b, (x, y) -> x ^ y);
+            case BITWISE_AND  -> NumericUtils.applyBitwise(a, b, (x, y) -> x & y);
+            case BITWISE_OR   -> NumericUtils.applyBitwise(a, b, (x, y) -> x | y);
+            case BITWISE_XOR  -> NumericUtils.applyBitwise(a, b, (x, y) -> x ^ y);
             default          -> null;
         };
     }

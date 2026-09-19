@@ -145,9 +145,19 @@ public class ExprParserTest {
     // ==================== L15: 变量与标识符 ====================
 
     @Test
-    public void simpleVariable() {
+    public void simpleVariable() throws Exception {
+        // 已声明的名字：解析期就能确认它是变量
+        context.declareVariable("x");
         VariableNode node = assertParse(VariableNode.class, "x");
         assertEquals("x", node.getName());
+    }
+
+    @Test
+    public void undeclaredNameIsUnresolvedNameRef() {
+        // 未声明的裸名字：解析期不给身份（可能是变量、类名、内置函数…），交给 link 层
+        NameRefNode node = assertParse(NameRefNode.class, "x");
+        assertEquals("x", node.getName());
+        assertFalse(node.isResolved());
     }
 
     @Test
@@ -259,7 +269,7 @@ public class ExprParserTest {
     public void negate() {
         UnaryOpNode node = assertParse(UnaryOpNode.class, "-x");
         assertEquals(UnaryOpNode.Operator.NEGATIVE, node.getOperator());
-        assertTrue(node.getOperand() instanceof VariableNode);
+        assertIsVariable(node.getOperand(), "x");
     }
 
     @Test
@@ -296,7 +306,7 @@ public class ExprParserTest {
     public void castExpression() {
         CastNode node = assertParse(CastNode.class, "(int)x");
         assertEquals(int.class, node.getTargetType());
-        assertTrue(node.getExpression() instanceof VariableNode);
+        assertIsVariable(node.getExpression(), "x");
     }
 
     @Test
@@ -787,8 +797,19 @@ public class ExprParserTest {
     }
 
     private void assertIsVariable(ASTNode node, String expectedName) {
-        assertTrue(node instanceof VariableNode);
-        assertEquals(expectedName, ((VariableNode) node).getName());
+        // 解析期不再给裸名字定身份：已声明的名字是 VariableNode，
+        // 未声明的裸名字是 NameRefNode（是不是类名/函数由 link 层判）。两者都算变量引用。
+        String actualName;
+        if (node instanceof VariableNode v) {
+            actualName = v.getName();
+        } else if (node instanceof NameRefNode n) {
+            actualName = n.getName();
+        } else {
+            actualName = null;
+        }
+        assertNotNull("Expected a variable reference but got " + node.getClass().getSimpleName(),
+                actualName);
+        assertEquals(expectedName, actualName);
     }
 
     // ==================== 排查测试: 链式调用 / 消歧 ====================

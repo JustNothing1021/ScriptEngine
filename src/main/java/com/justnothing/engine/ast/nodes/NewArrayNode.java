@@ -12,12 +12,16 @@ public class NewArrayNode extends ASTNode {
     private final Class<?> elementType;
     private final ASTNode size;
     private final List<ASTNode> sizes;
-    
-    private NewArrayNode(Class<?> elementType, ASTNode size, List<ASTNode> sizes, SourceLocation location) {
+    /** 花括号初始化器 {@code new Type[] {…}}；无初始化器时为 null */
+    private final ArrayLiteralNode initializer;
+
+    private NewArrayNode(Class<?> elementType, ASTNode size, List<ASTNode> sizes,
+                         ArrayLiteralNode initializer, SourceLocation location) {
         super(location);
         this.elementType = elementType;
         this.size = size;
         this.sizes = sizes;
+        this.initializer = initializer;
     }
     
     public Class<?> getElementType() {
@@ -30,6 +34,10 @@ public class NewArrayNode extends ASTNode {
     
     public List<ASTNode> getSizes() {
         return sizes;
+    }
+
+    public ArrayLiteralNode getInitializer() {
+        return initializer;
     }
     
     public int getDimensionCount() {
@@ -48,19 +56,28 @@ public class NewArrayNode extends ASTNode {
     
     @Override
     public String formatString(int indent) {
-        String sb = indent(indent) + "NewArrayNode\n" +
-                indent(indent + 1) + "elementType: " + elementType.getSimpleName() + "\n" +
-                indent(indent + 1) + "sizes:\n";
+        StringBuilder sb = new StringBuilder();
+        sb.append(indent(indent)).append("NewArrayNode\n");
+        sb.append(indent(indent + 1)).append("elementType: ").append(elementType.getSimpleName()).append("\n");
+        sb.append(indent(indent + 1)).append("sizes:\n");
         for (ASTNode s : sizes) {
-            sb += s.formatString(indent + 2) + "\n";
+            // 空维度（new Type[] {…} 里的 []）为 null
+            sb.append(s == null
+                    ? indent(indent + 2) + "<empty>\n"
+                    : s.formatString(indent + 2) + "\n");
         }
-        return sb.stripTrailing();
+        if (initializer != null) {
+            sb.append(indent(indent + 1)).append("initializer:\n");
+            sb.append(initializer.formatString(indent + 2)).append("\n");
+        }
+        return sb.toString().stripTrailing();
     }
 
     public static class Builder extends ASTNode.Builder<Builder> {
         private Class<?> elementType;
         private ASTNode size;
         private List<ASTNode> sizes = Collections.emptyList();
+        private ArrayLiteralNode initializer;
 
         public Builder elementType(Class<?> elementType) {
             this.elementType = elementType;
@@ -77,9 +94,14 @@ public class NewArrayNode extends ASTNode {
             return this;
         }
 
+        public Builder initializer(ArrayLiteralNode initializer) {
+            this.initializer = initializer;
+            return this;
+        }
+
         @Override
         public ASTNode build() {
-            return new NewArrayNode(elementType, size, sizes, location);
+            return new NewArrayNode(elementType, size, sizes, initializer, location);
         }
     }
 }
