@@ -28,7 +28,7 @@ package com.justnothing.engine.security;
  * <h3>定位：策略声明，不是安全边界</h3>
  * <p><b>本类不提供任何强制能力，它只是一份"允许什么"的声明。</b>
  * <ul>
- *   <li>15 个 boolean 标志在引擎内部<b>没有任何消费方</b>，只有 getter。它们是给宿主
+ *   <li>16 个 boolean 标志在引擎内部<b>没有任何消费方</b>，只有 getter。它们是给宿主
  *       （如 Android 侧的 {@code BlockGuardSandbox} / seccomp 装配逻辑）读的，
  *       由宿主决定装哪一层强制机制。引擎自己不会执行它们。</li>
  *   <li>{@link #getPermissionChecker()} 才是引擎唯一会执行的部分，由
@@ -62,6 +62,7 @@ public class SandboxConfig {
     private final boolean threadCreateAllowed;
     private final boolean threadModifyAllowed;
     private final boolean processCreateAllowed;
+    private final boolean execAllowed;
     private final boolean reflectionAllowed;
     private final boolean systemExitAllowed;
     private final boolean systemPropertyAllowed;
@@ -80,7 +81,7 @@ public class SandboxConfig {
             .denyDiskRead().denyDiskWrite().denyFileDelete()
             .denyNetwork().allowLocalSocket()
             .denyThreadCreate().denyThreadModify()
-            .denyProcessCreate().denyReflection()
+            .denyProcessCreate().denyExec().denyReflection()
             .denySystemExit().denySystemProperty()
             .denySystemEnv().denyClassLoader()
             .denyUnsafe().denyNative()
@@ -91,7 +92,7 @@ public class SandboxConfig {
             .denyDiskRead().denyDiskWrite().denyFileDelete()
             .denyNetwork().denyLocalSocket()
             .denyThreadCreate().denyThreadModify()
-            .denyProcessCreate().denyReflection()
+            .denyProcessCreate().denyExec().denyReflection()
             .denySystemExit().denySystemProperty()
             .denySystemEnv().denyClassLoader()
             .denyUnsafe().denyNative()
@@ -103,7 +104,7 @@ public class SandboxConfig {
             .denyDiskRead().denyDiskWrite().denyFileDelete()
             .denyNetwork().denyLocalSocket()
             .denyThreadCreate().denyThreadModify()
-            .denyProcessCreate().denyReflection()
+            .denyProcessCreate().denyExec().denyReflection()
             .denySystemExit().denySystemProperty()
             .denySystemEnv().denyClassLoader()
             .denyUnsafe().denyNative()
@@ -114,7 +115,7 @@ public class SandboxConfig {
             .allowDiskRead().denyDiskWrite().denyFileDelete()
             .denyNetwork().allowLocalSocket()
             .denyThreadCreate().denyThreadModify()
-            .denyProcessCreate().denyReflection()
+            .denyProcessCreate().denyExec().denyReflection()
             .denySystemExit().denySystemProperty()
             .denySystemEnv().denyClassLoader()
             .denyUnsafe().denyNative()
@@ -125,7 +126,7 @@ public class SandboxConfig {
             .allowDiskRead().allowDiskWrite().allowFileDelete()
             .allowNetwork().allowLocalSocket()
             .allowThreadCreate().allowThreadModify()
-            .allowProcessCreate().allowReflection()
+            .allowProcessCreate().allowExec().allowReflection()
             .allowSystemExit().allowSystemProperty()
             .allowSystemEnv().allowClassLoader()
             .allowUnsafe().allowNative()
@@ -143,6 +144,7 @@ public class SandboxConfig {
         this.threadCreateAllowed = builder.threadCreateAllowed;
         this.threadModifyAllowed = builder.threadModifyAllowed;
         this.processCreateAllowed = builder.processCreateAllowed;
+        this.execAllowed = builder.execAllowed;
         this.reflectionAllowed = builder.reflectionAllowed;
         this.systemExitAllowed = builder.systemExitAllowed;
         this.systemPropertyAllowed = builder.systemPropertyAllowed;
@@ -163,6 +165,7 @@ public class SandboxConfig {
     public boolean isThreadCreateAllowed() { return threadCreateAllowed; }
     public boolean isThreadModifyAllowed() { return threadModifyAllowed; }
     public boolean isProcessCreateAllowed() { return processCreateAllowed; }
+    public boolean isExecAllowed() { return execAllowed; }
     public boolean isReflectionAllowed() { return reflectionAllowed; }
     public boolean isSystemExitAllowed() { return systemExitAllowed; }
     public boolean isSystemPropertyAllowed() { return systemPropertyAllowed; }
@@ -190,6 +193,7 @@ public class SandboxConfig {
         private boolean threadCreateAllowed = false;
         private boolean threadModifyAllowed = false;
         private boolean processCreateAllowed = false;
+        private boolean execAllowed = false;
         private boolean reflectionAllowed = false;
         private boolean systemExitAllowed = false;
         private boolean systemPropertyAllowed = false;
@@ -259,6 +263,8 @@ public class SandboxConfig {
         public Builder denyThreadModify() { threadModifyAllowed = false; return this; }
         public Builder allowProcessCreate() { processCreateAllowed = true; return this; }
         public Builder denyProcessCreate() { processCreateAllowed = false; return this; }
+        public Builder allowExec() { execAllowed = true; return this; }
+        public Builder denyExec() { execAllowed = false; return this; }
 
         // ===== 反射 =====
         public Builder allowReflection() { reflectionAllowed = true; return this; }
