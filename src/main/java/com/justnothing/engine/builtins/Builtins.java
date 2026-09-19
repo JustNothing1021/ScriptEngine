@@ -2,6 +2,8 @@ package com.justnothing.engine.builtins;
 
 import com.justnothing.engine.api.IOutputHandler;
 import com.justnothing.engine.eval.Value;
+import com.justnothing.engine.security.PermissionType;
+import com.justnothing.engine.security.SecurityGate;
 
 import java.io.InputStream;
 import java.lang.reflect.Array;
@@ -29,11 +31,53 @@ public class Builtins {
 
     private final BuiltinRegistry registry;
     private IOutputHandler outputHandler;
+    /** 安全门卫，null 表示无限制。由 EvalContext 在设置 gate 时同步进来。 */
+    private SecurityGate securityGate;
 
     public Builtins(BuiltinRegistry registry, IOutputHandler outputHandler) {
         this.registry = registry;
         this.outputHandler = outputHandler;
         registerAll();
+    }
+
+    /**
+     * 注入安全门卫（null = 无限制）。
+     * <p>
+     * 部分 builtin（{@code getField} / {@code setField} / {@code invokeMethod} / {@code analyze} /
+     * {@code cast} / {@code isInstanceOf}）会自己做反射，必须和解释器共用同一个 gate ——
+     * 否则这些入口就成了绕过策略的后门。
+     * </p>
+     */
+    public void setSecurityGate(SecurityGate securityGate) {
+        this.securityGate = securityGate;
+    }
+
+    private void checkFieldRead(Field field) {
+        if (securityGate != null) securityGate.beforeFieldRead(field);
+    }
+
+    private void checkFieldWrite(Field field) {
+        if (securityGate != null) securityGate.beforeFieldWrite(field);
+    }
+
+    private void checkMethodCall(Method method) {
+        if (securityGate != null) securityGate.beforeMethodCall(method);
+    }
+
+    private void checkClassByName(String className) {
+        if (securityGate != null) securityGate.beforeClassAccessByName(className);
+    }
+
+    private void checkThreadCreate() {
+        if (securityGate != null) securityGate.checkPermission(PermissionType.THREAD_CREATE);
+    }
+
+    /** {@code cast()} 的实际转换（类访问检查已在调用处完成）。 */
+    private static Value castTo(Class<?> targetClass, Object obj) {
+        if (!targetClass.isInstance(obj)) {
+            throw new RuntimeException("Cannot cast " + obj.getClass().getName() + " to " + targetClass.getName());
+        }
+        return wrap(targetClass.cast(obj));
     }
 
     public void setOutputHandler(IOutputHandler outputHandler) {
@@ -103,7 +147,15 @@ public class Builtins {
     };
 
     private static String formatValue(Object value) {
-        if (value.getClass().isArray()) return Arrays.deepToString((Object[]) value);
+        if (value == null) return "null";
+        if (value.getClass().isArray()) {
+            // 原生数组（int[] 等）不能强转 Object[]，先反射装箱再深打印
+            if (value instanceof Object[] arr) return Arrays.deepToString(arr);
+            int length = Array.getLength(value);
+            Object[] boxed = new Object[length];
+            for (int i = 0; i < length; i++) boxed[i] = Array.get(value, i);
+            return Arrays.deepToString(boxed);
+        }
         return Objects.toString(value);
     }
 
@@ -117,11 +169,30 @@ public class Builtins {
         return Double.parseDouble(v.toString());
     }
 
+    /** 全部入参都是整型（不含 Float/Double）——用于让 min/max/clamp 保持整型结果。 */
+    private static boolean allIntegral(Object[] raw) {
+        for (Object o : raw) {
+            if (o instanceof Float || o instanceof Double) return false;
+            if (!(o instanceof Number) && !(o instanceof Character)) return false;
+        }
+        return true;
+    }
+
+    private static boolean hasLong(Object[] raw) {
+        for (Object o : raw) {
+            if (o instanceof Long) return true;
+        }
+        return false;
+    }
+
     private static List<Integer> createRange(int start, int end, int step) {
+        if (step == 0) {
+            throw new IllegalArgumentException("range() step must not be 0");
+        }
         List<Integer> list = new ArrayList<>();
         if (step > 0) {
             for (int i = start; i < end; i += step) list.add(i);
-        } else if (step < 0) {
+        } else {
             for (int i = start; i > end; i += step) list.add(i);
         }
         return list;
@@ -153,11 +224,21 @@ public class Builtins {
             Value result = f.apply(wrapped);
             return result != null ? result.asJavaObject() : null;
         }
+        // lambda 字面量求值后是 Lambda 对象（不是 Function），高阶函数必须也认它，
+        // 否则 map([1,2,3], x -> x * 2) 会报 "Not a callable function"
+        if (funcObj instanceof Lambda lambda) {
+            Value[] wrapped = new Value[callArgs.length];
+            for (int i = 0; i < callArgs.length; i++) {
+                wrapped[i] = Value.of(callArgs[i]);
+            }
+            Value result = lambda.invoke(wrapped);
+            return result != null ? result.asJavaObject() : null;
+        }
         if (funcObj instanceof Method m) {
             try {
                 return m.invoke(null, callArgs);
             } catch (Exception e) {
-                throw new RuntimeException("Failed to call method: " + e.getMessage());
+                throw new RuntimeException("Failed to call method: " + e.getMessage(), e);
             }
         }
         throw new RuntimeException("Not a callable function: " + funcObj);
@@ -405,8 +486,15 @@ public class Builtins {
             Object className = args.get(1).asJavaObject();
             if (obj == null) return wrap(false);
             try {
-                Class<?> targetClass = (className instanceof Class) ? (Class<?>) className : Class.forName(className.toString());
+                if (className instanceof Class<?> c) {
+                    checkClassByName(c.getName());
+                    return wrap(c.isInstance(obj));
+                }
+                checkClassByName(className.toString());
+                Class<?> targetClass = Class.forName(className.toString());
                 return wrap(targetClass.isInstance(obj));
+            } catch (SecurityException e) {
+                throw e;
             } catch (Exception e) {
                 throw new RuntimeException("Failed to find class: " + className);
             }
@@ -418,11 +506,14 @@ public class Builtins {
             Object className = args.get(1).asJavaObject();
             if (obj == null) return Value.NullValue.INSTANCE;
             try {
-                Class<?> targetClass = (className instanceof Class) ? (Class<?>) className : Class.forName(className.toString());
-                if (!targetClass.isInstance(obj)) {
-                    throw new RuntimeException("Cannot cast " + obj.getClass().getName() + " to " + targetClass.getName());
+                if (className instanceof Class<?> c) {
+                    checkClassByName(c.getName());
+                    return castTo(c, obj);
                 }
-                return wrap(targetClass.cast(obj));
+                checkClassByName(className.toString());
+                return castTo(Class.forName(className.toString()), obj);
+            } catch (SecurityException e) {
+                throw e;
             } catch (ClassNotFoundException e) {
                 throw new RuntimeException("Failed to find class: " + className);
             }
@@ -435,8 +526,11 @@ public class Builtins {
             if (obj == null) throw new RuntimeException("getField() first argument cannot be null");
             try {
                 Field f = obj.getClass().getDeclaredField(fieldName);
+                checkFieldRead(f);
                 f.setAccessible(true);
                 return wrap(f.get(obj));
+            } catch (SecurityException e) {
+                throw e;
             } catch (Exception e) {
                 throw new RuntimeException("Failed to get field: " + fieldName, e);
             }
@@ -450,9 +544,12 @@ public class Builtins {
             if (obj == null) throw new RuntimeException("setField() first argument cannot be null");
             try {
                 Field f = obj.getClass().getDeclaredField(fieldName);
+                checkFieldWrite(f);
                 f.setAccessible(true);
                 f.set(obj, value);
                 return Value.VoidValue.INSTANCE;
+            } catch (SecurityException e) {
+                throw e;
             } catch (Exception e) {
                 throw new RuntimeException("Failed to set field: " + fieldName, e);
             }
@@ -470,11 +567,14 @@ public class Builtins {
             try {
                 for (Method m : obj.getClass().getDeclaredMethods()) {
                     if (m.getName().equals(methodName)) {
+                        checkMethodCall(m);
                         m.setAccessible(true);
                         return wrap(m.invoke(obj, methodArgs.toArray()));
                     }
                 }
                 throw new RuntimeException("Method not found: " + methodName);
+            } catch (SecurityException e) {
+                throw e;
             } catch (Exception e) {
                 throw new RuntimeException("Failed to invoke method: " + methodName, e);
             }
@@ -504,6 +604,8 @@ public class Builtins {
             else {
                 for (Field f : fields) {
                     r.append("  ").append(f);
+                    // 检查放在 try 之外：被拒绝时直接抛出，不能降级成 "[Cannot access]" 后继续打印其余字段
+                    checkFieldRead(f);
                     try { f.setAccessible(true); r.append(" = ").append(formatValue(f.get(target))); }
                     catch (Exception e) { r.append(" = [Cannot access: ").append(e.getMessage()).append("]"); }
                     r.append("\n");
@@ -532,17 +634,35 @@ public class Builtins {
             Object[] raw = unwrap(args);
             int min = toInt(raw[0]);
             int max = toInt(raw[1]);
-            return wrap(min + (int) (Math.random() * (max - min + 1)));
+            // 用 long 算区间宽度：max - min + 1 在整数边界上会溢出成负数，抽出的值跑到区间外
+            long span = (long) max - min + 1;
+            return wrap((int) (min + (long) (Math.random() * span)));
         });
 
         registerFunction("abs", args -> {
             if (args.size() != 1) throw new RuntimeException("abs() requires exactly 1 argument");
-            return wrap(Math.abs(toDouble(unwrap(args)[0])));
+            Object v = unwrap(args)[0];
+            // 整型入参保持整型（与 Math.abs(int)/abs(long) 一致），否则 abs(-3) 会得到 3.0
+            if (v instanceof Long value) return wrap(Math.abs(value));
+            if (v instanceof Number && !(v instanceof Double) && !(v instanceof Float)) {
+                return wrap(Math.abs(((Number) v).intValue()));
+            }
+            return wrap(Math.abs(toDouble(v)));
         });
 
         registerFunction("min", args -> {
             if (args.isEmpty()) throw new RuntimeException("min() requires at least 1 argument");
             Object[] raw = unwrap(args);
+            if (allIntegral(raw)) {
+                if (hasLong(raw)) {
+                    long m = toLong(raw[0]);
+                    for (int i = 1; i < raw.length; i++) m = Math.min(m, toLong(raw[i]));
+                    return wrap(m);
+                }
+                int m = toInt(raw[0]);
+                for (int i = 1; i < raw.length; i++) m = Math.min(m, toInt(raw[i]));
+                return wrap(m);
+            }
             double m = toDouble(raw[0]);
             for (int i = 1; i < raw.length; i++) m = Math.min(m, toDouble(raw[i]));
             return wrap(m);
@@ -551,6 +671,16 @@ public class Builtins {
         registerFunction("max", args -> {
             if (args.isEmpty()) throw new RuntimeException("max() requires at least 1 argument");
             Object[] raw = unwrap(args);
+            if (allIntegral(raw)) {
+                if (hasLong(raw)) {
+                    long m = toLong(raw[0]);
+                    for (int i = 1; i < raw.length; i++) m = Math.max(m, toLong(raw[i]));
+                    return wrap(m);
+                }
+                int m = toInt(raw[0]);
+                for (int i = 1; i < raw.length; i++) m = Math.max(m, toInt(raw[i]));
+                return wrap(m);
+            }
             double m = toDouble(raw[0]);
             for (int i = 1; i < raw.length; i++) m = Math.max(m, toDouble(raw[i]));
             return wrap(m);
@@ -559,8 +689,13 @@ public class Builtins {
         registerFunction("clamp", args -> {
             if (args.size() != 3) throw new RuntimeException("clamp() requires exactly 3 arguments");
             Object[] raw = unwrap(args);
-            double val = toDouble(raw[0]), minVal = toDouble(raw[1]), maxVal = toDouble(raw[2]);
-            return wrap(Math.max(minVal, Math.min(maxVal, val)));
+            if (allIntegral(raw)) {
+                if (hasLong(raw)) {
+                    return wrap(Math.max(toLong(raw[1]), Math.min(toLong(raw[2]), toLong(raw[0]))));
+                }
+                return wrap(Math.max(toInt(raw[1]), Math.min(toInt(raw[2]), toInt(raw[0]))));
+            }
+            return wrap(Math.max(toDouble(raw[1]), Math.min(toDouble(raw[2]), toDouble(raw[0]))));
         });
     }
 
@@ -609,19 +744,27 @@ public class Builtins {
 
         registerFunction("toBool", args -> {
             if (args.size() != 1) throw new RuntimeException("toBool() requires exactly 1 argument");
-            Object obj = args.get(0).asJavaObject();
+            Value v = args.get(0);
+            Object obj = v.asJavaObject();
             if (obj instanceof Boolean b) return wrap(b);
-            return wrap(Boolean.parseBoolean(obj.toString()));
+            if (obj instanceof String s) return wrap(Boolean.parseBoolean(s.trim()));
+            // 非字符串走引擎的真值语义（0 / 0.0 / 空 / null 为 false）。
+            // 原来一律交给 Boolean.parseBoolean，导致 toBool(1) 得到 false，toBool(null) 还会 NPE
+            return wrap(v.isTruthy());
         });
 
         registerFunction("hex", args -> {
             if (args.size() != 1) throw new RuntimeException("hex() requires exactly 1 argument");
-            return wrap(Integer.toHexString(toInt(unwrap(args)[0])));
+            Object v = unwrap(args)[0];
+            if (v instanceof Long value) return wrap(Long.toHexString(value));
+            return wrap(Integer.toHexString(toInt(v)));
         });
 
         registerFunction("bin", args -> {
             if (args.size() != 1) throw new RuntimeException("bin() requires exactly 1 argument");
-            return wrap(Integer.toBinaryString(toInt(unwrap(args)[0])));
+            Object v = unwrap(args)[0];
+            if (v instanceof Long value) return wrap(Long.toBinaryString(value));
+            return wrap(Integer.toBinaryString(toInt(v)));
         });
 
         registerFunction("isNull", args -> {
@@ -809,6 +952,7 @@ public class Builtins {
         registerFunction("runLater", args -> {
             if (args.size() != 1) throw new RuntimeException("runLater() requires one parameter: Runnable");
             Object runnable = args.get(0).asJavaObject();
+            checkThreadCreate();
             Thread thread = new Thread(() -> {
                 try {
                     callFunctionValue(runnable);

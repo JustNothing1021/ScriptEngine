@@ -659,6 +659,18 @@ public class ReplIntegrationTest {
     }
 
     @Test
+    public void regression_constantNarrowing_isLimittedToConstants() throws Exception {
+        // 常量窄化：byte b = 1; 合法（JLS §5.2）。修复前一律走严格类型检查而报错
+        assertNotNull(parseStatement("byte cn1 = 1;"));
+        assertNotNull(parseStatement("short cn2 = 4;"));
+        // 越界常量仍然拒绝
+        assertStmtError("byte cn3 = 128;", "Type mismatch");
+        // 运行时变量不适用常量窄化：int cn4 = 1; byte cn5 = cn4; 非法
+        parseStatement("int cn4 = 1;");
+        assertStmtError("byte cn5 = cn4;", "Type mismatch");
+    }
+
+    @Test
     public void regression_declarationIsVarDeclNotAssignment() throws Exception {
         // int x = 42; 必须是 VarDeclNode 而不是 AssignmentNode
         ASTNode node = parseStatement("int x = 42;");

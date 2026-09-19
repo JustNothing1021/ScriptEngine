@@ -220,7 +220,9 @@ public class BasicPermissionChecker implements IPermissionChecker {
         for (String pattern : patterns) {
             if (pattern.endsWith(".*")) {
                 String prefix = pattern.substring(0, pattern.length() - 2);
-                if (name.startsWith(prefix)) return true;
+                // 必须在包边界上匹配：`java.lang.*` 覆盖该包及其子包（java.lang.invoke.*），
+                // 但不能顺带命中仅前缀相同的 `java.langX.*`
+                if (name.startsWith(prefix + ".")) return true;
             } else if (pattern.equals(name)) {
                 return true;
             } else if (pattern.contains("*")) {

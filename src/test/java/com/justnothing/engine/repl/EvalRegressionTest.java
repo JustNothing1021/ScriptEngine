@@ -1257,4 +1257,278 @@ public class EvalRegressionTest {
                 + " class Circle extends Shape { int r = 4; }"
                 + " Circle c = new Circle(); c.r;"));
     }
+
+    // ==================== 数值运算符的类型提升 ====================
+
+    /** 用带 builtin 注册的 ScriptRunner 求值（builtin 只在 ScriptRunner 的上下文里注册）。 */
+    private Object evalWithRunner(String source) {
+        return new ScriptRunner().executeWithResult(source);
+    }
+
+    /** 执行并把 stdout 输出收集为字符串。 */
+    private String evalCapturingOutput(String source) {
+        DefaultOutputHandler handler = new DefaultOutputHandler(
+                new PrintStream(new ByteArrayOutputStream()), System.in);
+        new ScriptRunner(handler, handler).executeWithResult(source);
+        return handler.getString();
+    }
+
+    @Test
+    public void regression_numericEqualityPromotesTypes() {
+        // 修复前 == 落到 Value.equals，而 IntValue/LongValue/DoubleValue/CharValue 的 equals
+        // 是"同类型才相等"，1 == 1L、1 == 1.0、'a' == 97 全为 false
+        assertEquals(Boolean.TRUE, eval("1 == 1L;"));
+        assertEquals(Boolean.TRUE, eval("1 == 1.0;"));
+        assertEquals(Boolean.TRUE, eval("1.0 == 1;"));
+        assertEquals(Boolean.TRUE, eval("'a' == 97;"));
+        assertEquals(Boolean.FALSE, eval("1 != 1L;"));
+        assertEquals(Boolean.FALSE, eval("1 == 2L;"));
+    }
+
+    @Test
+    public void regression_numericEqualityPromotesTypesAtRuntime() {
+        assertEquals(Boolean.TRUE, eval("int a1 = 1; long b1 = 1L; a1 == b1;"));
+        assertEquals(Boolean.TRUE, eval("int a2 = 1; double d1 = 1.0; a2 == d1;"));
+        assertEquals(Boolean.TRUE, eval("char c1 = 'a'; c1 == 97;"));
+    }
+
+    @Test
+    public void regression_mixedNumericLiteralComparisonDoesNotCrash() {
+        // 修复前常量折叠用 ((Comparable) a).compareTo(b)：Integer.compareTo(Long) 抛
+        // ClassCastException，还被包成"内部错误"冒到调用方
+        assertEquals(Boolean.FALSE, eval("1 < 1L;"));
+        assertEquals(Boolean.TRUE, eval("1 <= 1.0;"));
+        assertEquals(Boolean.TRUE, eval("2 > 1L;"));
+        assertEquals(Boolean.TRUE, eval("1L <= 1;"));
+        assertEquals(Boolean.TRUE, eval("1.5 > 1;"));
+    }
+
+    @Test
+    public void regression_longBitwiseOpsSupported() {
+        // 修复前位运算只注册了 (int,int)：`long | long` 报 "No matching operator '|'"
+        assertEquals(Long.valueOf(3L), eval("long z1 = 1L; z1 | 2L;"));
+        assertEquals(Long.valueOf(2L), eval("long z2 = 6L; z2 & 3L;"));
+        assertEquals(Long.valueOf(2L), eval("long z3 = 1L; z3 ^ 3L;"));
+        assertEquals(Long.valueOf(3L), eval("long z4 = 1L; z4 | 2;"));
+        assertEquals(Long.valueOf(3L), eval("int i1 = 1; long z5 = 2L; i1 | z5;"));
+        assertEquals(Long.valueOf(-7L), eval("long z6 = 6L; ~z6;"));
+    }
+
+    @Test
+    public void regression_longShiftKeeps64BitWidth() {
+        // 修复前移位同样只有 (int,int) 重载，long 左操作数被 asInt() 截断：
+        // 1L << 40 得到 256（正确 1099511627776），3000000000L >> 1 得到负数
+        assertEquals(Long.valueOf(1099511627776L), eval("long x1 = 1L; x1 << 40;"));
+        assertEquals(Long.valueOf(1500000000L), eval("long y1 = 3000000000L; y1 >> 1;"));
+        assertEquals(Long.valueOf(1500000000L), eval("long y2 = 3000000000L; y2 >>> 1;"));
+        assertEquals(8, eval("int i2 = 1; long d2 = 3L; i2 << d2;"));
+    }
+
+    @Test
+    public void regression_charArithmeticPromotesToInt() {
+        assertEquals(98, eval("'a' + 1;"));
+    }
+
+    // ==================== builtin 函数 ====================
+
+    @Test
+    public void regression_printlnHandlesNullAndPrimitiveArrays() {
+        // 修复前 formatValue 对 null 直接 NPE，对 int[] 强转 Object[] 抛 ClassCastException
+        assertEquals("null", evalCapturingOutput("println(null);").trim());
+        assertEquals("[1, 2, 3]", evalCapturingOutput("println([1, 2, 3]);").trim());
+    }
+
+    @Test
+    public void regression_higherOrderBuiltinsAcceptLambdaLiterals() {
+        // 修复前 callFunctionValue 只认 Function/Method，lambda 字面量（Lambda 对象）
+        // 一律报 "Not a callable function: Lambda[...]"
+        assertEquals(6, evalWithRunner("reduce([1, 2, 3], (a, b) -> a + b, 0);"));
+        assertEquals(4, evalWithRunner("map([1, 2, 3], x -> x * 2)[1];"));
+        assertEquals(2, evalWithRunner("filter([1, 2, 3], x -> x > 1)[0];"));
+    }
+
+    @Test
+    public void regression_minMaxAbsClampKeepIntegralTypes() {
+        // 修复前一律走 toDouble，min(1, 2) 返回 1.0（DoubleValue），整数下标/赋值会类型不匹配
+        assertEquals(Integer.valueOf(1), evalWithRunner("min(1, 2);"));
+        assertEquals(Integer.valueOf(3), evalWithRunner("max(1, 2, 3);"));
+        assertEquals(Integer.valueOf(3), evalWithRunner("abs(-3);"));
+        assertEquals(Integer.valueOf(3), evalWithRunner("clamp(5, 1, 3);"));
+        assertEquals(Long.valueOf(1L), evalWithRunner("min(1L, 2);"));
+        assertEquals(Double.valueOf(1.5), evalWithRunner("min(1.5, 2);"));
+    }
+
+    @Test
+    public void regression_toBoolUsesTruthiness() {
+        // 修复前一律 Boolean.parseBoolean(obj.toString())：toBool(1) → false，toBool(null) → NPE
+        assertEquals(Boolean.TRUE, evalWithRunner("toBool(1);"));
+        assertEquals(Boolean.FALSE, evalWithRunner("toBool(0);"));
+        assertEquals(Boolean.FALSE, evalWithRunner("toBool(null);"));
+        assertEquals(Boolean.TRUE, evalWithRunner("toBool(\"true\");"));
+        assertEquals(Boolean.FALSE, evalWithRunner("toBool(\"false\");"));
+    }
+
+    @Test
+    public void regression_rangeRejectsZeroStep() {
+        // 修复前 step == 0 两个分支都不进入，静默返回空列表
+        try {
+            evalWithRunner("range(1, 5, 0);");
+            fail("step == 0 应当报错");
+        } catch (RuntimeException expected) {
+            assertTrue("异常信息应说明 step 为 0，实际: " + expected.getMessage(),
+                    String.valueOf(expected.getMessage()).contains("step"));
+        }
+    }
+
+    @Test
+    public void regression_hexAndBinSupportLong() {
+        // 修复前经 toInt 截断，hex(4294967296L) 得到 "0"
+        assertEquals("100000000", evalWithRunner("hex(4294967296L);"));
+        assertEquals("ffffffff", evalWithRunner("hex(-1);"));
+        assertEquals("100000000000000000000000000000000", evalWithRunner("bin(4294967296L);"));
+    }
+
+    // ==================== 脚本类字段初始化与访问标志 ====================
+
+    @Test
+    public void regression_charFieldInitializerGenerates() {
+        // 修复前 pushLiteral 对 char 走 (Number) 强转，Character 不是 Number → ClassCastException
+        assertEquals(Character.valueOf('a'),
+                eval("class CharF { char c = 'a'; } CharF f = new CharF(); f.c;"));
+        assertEquals(Character.valueOf('a'), eval("class CharS { static char c = 'a'; } CharS.c;"));
+    }
+
+    @Test
+    public void regression_fieldInitializerUsesDeclaredType() {
+        // 修复前按字面量自身类型压栈：long a = 30; 会得到 VerifyError: Bad type on operand stack
+        assertEquals(Long.valueOf(30L), eval("class LongF { long a = 30; } LongF x1 = new LongF(); x1.a;"));
+        assertEquals(Double.valueOf(1.0), eval("class DblF { double a = 1; } DblF x2 = new DblF(); x2.a;"));
+        // 引擎把 float 统一表示为 DoubleValue（Value.of 没有 FloatValue），这里按 Double 断言
+        assertEquals(Double.valueOf(1.5), eval("class FltF { float a = 1.5f; } FltF x3 = new FltF(); x3.a;"));
+        // 大 long 不能被 double 中间量吃掉精度
+        assertEquals(Long.valueOf(9007199254740993L),
+                eval("class HugeF { long a = 9007199254740993L; } HugeF x4 = new HugeF(); x4.a;"));
+    }
+
+    @Test
+    public void regression_staticFinalConstantCoercesToFieldType() {
+        // 修复前 ConstantValue 直接写字面量自身类型：`static final long L = 30;` 产出
+        // "字段描述符 J + CONSTANT_Integer"，JVM 抛
+        // ClassFormatError: Inconsistent constant value type
+        assertEquals(Long.valueOf(30L), eval("class LongC { static final long L = 30; } LongC.L;"));
+        assertEquals(Double.valueOf(1.0), eval("class DblC { static final double D = 1; } DblC.D;"));
+        assertEquals(Double.valueOf(1.5), eval("class FltC { static final float F = 1.5f; } FltC.F;"));
+        assertEquals(Integer.valueOf(7), eval("class IntC { static final int I = 7; } IntC.I;"));
+        assertEquals("s", eval("class StrC { static final String S = \"s\"; } StrC.S;"));
+        assertEquals(Boolean.TRUE, eval("class BoolC { static final boolean B = true; } BoolC.B;"));
+    }
+
+    @Test
+    public void regression_explicitAccessModifiersDoNotProduceIllegalFlags() {
+        // 修复前无条件 mods |= ACC_PUBLIC：private int x; 得到 0x0003（private|public），
+        // JVM 抛 ClassFormatError: Illegal field modifiers。
+        // 按引擎约定（成员解析走反射、宿主需直接可见）显式 private/protected 归一化为 public
+        assertEquals(1, eval("class PrivF { private int a = 1; } new PrivF().a;"));
+        assertEquals(1, eval("class PrivM { private int f() { return 1; } } new PrivM().f();"));
+        assertEquals(2, eval("class P1 { private int f() { return 1; } int g() { return f() + 1; } } new P1().g();"));
+        assertEquals(9, eval("class P3 { private int a = 5; void set(int v) { a = v; } int get() { return a; } }"
+                + " P3 p = new P3(); p.set(9); p.get();"));
+        assertEquals(3, eval("class P4 { private int a; private P4(int v) { a = v; }"
+                + " static P4 make(int v) { return new P4(v); } int get() { return a; } } P4.make(3).get();"));
+        assertEquals(1, eval("class ProtF { protected int a = 1; } new ProtF().a;"));
+    }
+
+    @Test
+    public void regression_abstractMethodHasNoCodeAttribute() {
+        // 修复前抽象方法也写 visitCode()，JVM 抛
+        // ClassFormatError: Code attribute in native or abstract methods
+        eval("abstract class AbsM { abstract int f(); }");
+        // 抽象方法的存在不应影响同类的具体方法
+        assertEquals(2, eval("abstract class AbsM2 { abstract int f(); int g() { return 2; } } new AbsM2() {"
+                + " int f() { return 0; } }.g();"));
+    }
+
+    // ==================== 与 Java 语义对齐 ====================
+
+    @Test
+    public void regression_floatDivisionByZeroFollowsIeee754() {
+        // 修复前浮点除法也走整数除零检查，`1.0 / 0` 直接抛 ArithmeticException。
+        // Java 语义：浮点除法遵循 IEEE 754 → Infinity / NaN，不抛异常
+        assertEquals(Double.POSITIVE_INFINITY, eval("1.0 / 0;"));
+        assertEquals(Double.POSITIVE_INFINITY, eval("1 / 0.0;"));
+        assertEquals(Double.NEGATIVE_INFINITY, eval("1.0 / -0.0;"));
+        assertEquals(Double.NaN, eval("0.0 / 0;"));
+        // 运行期（非常量折叠）路径同样如此
+        assertEquals(Double.POSITIVE_INFINITY, eval("double a = 1.0; double b = 0; a / b;"));
+        assertEquals(Double.NaN, eval("double c = 0.0; double d = 0.0; c % d;"));
+    }
+
+    @Test
+    public void regression_integerDivisionByZeroStillThrows() {
+        // 浮点放开不能顺手放过整数除零
+        try {
+            eval("1 / 0;");
+            fail("整数除零应当抛异常");
+        } catch (RuntimeException expected) {
+            // ok：ConstantFolder 放弃折叠 + 运行期整除检查
+        }
+        try {
+            eval("int a = 1; int b = 0; a % b;");
+            fail("整数取模零应当抛异常");
+        } catch (RuntimeException expected) {
+            // ok
+        }
+    }
+
+    @Test
+    public void regression_constantNarrowingAssignment() {
+        // 与 Java 对齐（JLS §5.2）：值在目标范围内的 int 常量可以赋给 byte/short/char
+        assertEquals(1, ((Number) eval("byte b1 = 1; b1;")).intValue());
+        assertEquals(4, ((Number) eval("short s1 = 4; s1;")).intValue());
+        assertEquals(65, ((Number) eval("char c1 = 65; c1;")).intValue());
+        // 常量折叠后的表达式同样算"常量"
+        assertEquals(2, ((Number) eval("byte b2 = 1 + 1; b2;")).intValue());
+    }
+
+    // ==================== 跨运行的缓存/登记表隔离 ====================
+
+    @Test
+    public void regression_newScriptLoaderClearsClassResolutionCache() {
+        // 每次运行都会新建 DynamicClassGenerator（内含可定义脚本类的 Loader）。
+        // 类解析缓存只按类名索引、不含 Loader：
+        //   - 不清空 → 同名脚本类跨运行命中上一次的 Class；
+        //   - 更隐蔽的是负缓存：上一次记下的 NOT_FOUND 会让这一次新定义的类永远解析不到。
+        ClassResolver.clearClassCache();
+        ClassLoader loaderA = new DynamicClassGenerator(getClass().getClassLoader()).getLoader();
+        assertNotNull(ClassResolver.findClass("java.lang.String", loaderA));
+        assertNull(ClassResolver.findClass("no.such.ClassHere", loaderA));
+        assertTrue("前置条件：缓存里应有条目", ClassResolver.getCacheSize() > 0);
+
+        new DynamicClassGenerator(getClass().getClassLoader());
+        assertEquals("新的脚本 Loader 出现后必须清空类解析缓存", 0, ClassResolver.getCacheSize());
+    }
+
+    @Test
+    public void regression_scriptClassBodyIsNotReusedAcrossRuns() {
+        // 方法体登记在生成它的 DynamicClassGenerator 上。修复前是静态表（key 只有
+        // 类名+方法名+描述符），第二次运行同名类会命中上一次的方法体 —— 改了脚本却不生效
+        ScriptRunner first = new ScriptRunner(getClass().getClassLoader());
+        assertEquals(1, first.executeWithResult("class Reuse { int f() { return 1; } } new Reuse().f();"));
+
+        ScriptRunner second = new ScriptRunner(getClass().getClassLoader());
+        assertEquals(2, second.executeWithResult("class Reuse { int f() { return 2; } } new Reuse().f();"));
+    }
+
+    @Test
+    public void regression_methodBodiesAreNotSharedBetweenCodeGenerators() {
+        // 方法体必须挂在"生成它的那个" codegen 上：静态表会让两个运行器互相看见对方的
+        // 同名类方法体，且条目永不回收（AST 跟着泄漏）
+        assertEquals(1, eval("class MBody { int f() { return 1; } } 1;"));
+        assertNotNull("方法体应登记在本测试的 codegen 上",
+                codegen.findMethodBody("MBody", "f", "()I", 0));
+
+        DynamicClassGenerator other = new DynamicClassGenerator(getClass().getClassLoader());
+        assertNull("另一个 codegen 不应看见别人登记的方法体",
+                other.findMethodBody("MBody", "f", "()I", 0));
+    }
 }

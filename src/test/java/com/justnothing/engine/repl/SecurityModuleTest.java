@@ -104,6 +104,27 @@ public class SecurityModuleTest {
     }
 
     @Test
+    public void checker_wildcardStopsAtPackageBoundary() {
+        // 包通配符的语义是"该包 + 其子包"，但必须停在包边界上。
+        // 修复前是 name.startsWith(prefix) 且不补 '.'，于是 `android.*` 会连带拒绝
+        // androidx.*（过度拦截）。
+        IPermissionChecker allowed = BasicPermissionChecker.builder()
+                .defaultDeny()
+                .allowClass("java.lang.*")
+                .build();
+        assertTrue(allowed.hasClassAccess("java.lang.String"));
+        assertTrue(allowed.hasClassAccess("java.lang.invoke.MethodHandles")); // 子包同样命中
+        assertFalse(allowed.hasClassAccess("java.langX.Foo")); // 仅前缀相同，不是子包
+
+        IPermissionChecker denied = BasicPermissionChecker.builder()
+                .defaultAllow()
+                .denyClass("android.*")
+                .build();
+        assertFalse(denied.hasClassAccess("android.os.Handler"));
+        assertTrue(denied.hasClassAccess("androidx.appcompat.app.AppCompatActivity"));
+    }
+
+    @Test
     public void checker_exactDenyOverExactAllow() {
         // deny > allow in priority
         IPermissionChecker c = BasicPermissionChecker.builder()
@@ -363,7 +384,59 @@ public class SecurityModuleTest {
         assertEquals("java.lang.Object", result);
     }
 
+    // ==================== 6. builtin 反射入口与 gate 接线 ====================
+
+    @Test
+    public void e2e_builtinReflectionHonorsGate() {
+        // getField / setField / invokeMethod / analyze / cast / isInstanceOf 自己做反射，
+        // 修复前完全不经过 SecurityGate —— 是绕过策略的后门
+        IPermissionChecker denyString = BasicPermissionChecker.builder()
+                .defaultAllow()
+                .denyClass("java.lang.String")
+                .build();
+        runner.setPermissionChecker(denyString);
+
+        // 基准：解释器直接调用被拦
+        assertSecurityDenied("\"abc\".length()");
+        // 后门入口：必须走同一套检查
+        assertSecurityDenied("invokeMethod(\"abc\", \"length\")");
+        assertSecurityDenied("getField(\"abc\", \"value\")");
+        assertSecurityDenied("analyze(\"abc\")");
+        assertSecurityDenied("isInstanceOf(\"abc\", \"java.lang.String\")");
+        // lambda 在子 EvalContext 中执行，builtin 实例是新创建的 → gate 必须继承下去
+        assertSecurityDenied("map([\"abc\"], s -> invokeMethod(s, \"length\"))");
+    }
+
+    @Test
+    public void e2e_builtinReflectionWorksWithoutGate() {
+        // 零开销模式（checker == null）下这些入口必须照常工作
+        assertNull(runner.getPermissionChecker());
+        assertEquals(3, runner.executeWithResult("invokeMethod(\"abc\", \"length\")"));
+        assertNotNull(runner.executeWithResult("getField(\"abc\", \"value\")"));
+        assertEquals(Boolean.TRUE, runner.executeWithResult("isInstanceOf(\"abc\", \"java.lang.String\")"));
+    }
+
+    @Test
+    public void e2e_runLaterRequiresThreadPermission() {
+        runner.setPermissionChecker(BasicPermissionChecker.builder()
+                .defaultAllow()
+                .denyPermission(PermissionType.THREAD_CREATE)
+                .build());
+        assertSecurityDenied("runLater(() -> 1);");
+    }
+
     // ==================== 工具方法 ====================
+
+    /** 断言脚本被安全策略拦截（异常链最深处是 SecurityException）。 */
+    private void assertSecurityDenied(String script) {
+        try {
+            runner.executeWithResult(script);
+            fail("应当被安全策略拦截: " + script);
+        } catch (Throwable e) {
+            String msg = getRootCauseMessage(e);
+            assertTrue("期望安全策略拒绝，实际: " + msg, msg.contains("SecurityGate"));
+        }
+    }
 
     private static String getRootCauseMessage(Throwable t) {
         Throwable cause = t;

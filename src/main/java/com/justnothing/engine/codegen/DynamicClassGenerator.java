@@ -1,7 +1,9 @@
 package com.justnothing.engine.codegen;
 
+import com.justnothing.engine.api.ClassResolver;
 import com.justnothing.engine.ast.ASTNode;
 import com.justnothing.engine.ast.nodes.ClassDeclarationNode;
+import com.justnothing.engine.ast.nodes.ClassModifiers;
 import com.justnothing.engine.ast.nodes.ClassReferenceNode;
 import com.justnothing.engine.ast.nodes.ConstructorDeclarationNode;
 import com.justnothing.engine.ast.nodes.FieldDeclarationNode;
@@ -71,6 +73,14 @@ public final class DynamicClassGenerator {
     private static final String VALUE_OF_BYTE_SIG = "(B)Ljava/lang/Byte;";
 
     private final Map<String, Class<?>> cache = new ConcurrentHashMap<>();
+    /**
+     * 已生成类的方法体（{@code 类名#方法名#描述符} → AST），供 {@link CustomClassExecutor}
+     * 解释执行。
+     * <p><b>刻意放在实例上而不是静态表里</b>：这个 Loader 生成的全部类都由本实例持有，
+     * 方法体跟着实例走，生命周期天然对齐 —— 静态表既会跨运行泄漏 AST（条目永不回收），
+     * 又会让"同名脚本类"在两次运行之间互相覆盖方法体。
+     */
+    private final Map<String, MethodDeclarationNode> methodBodies = new ConcurrentHashMap<>();
     private final Loader loader;
     private ClassDefiner classDefiner;
     private boolean delegateToExecutor;
@@ -78,6 +88,9 @@ public final class DynamicClassGenerator {
 
     public DynamicClassGenerator(ClassLoader parentLoader) {
         this.loader = new Loader(parentLoader);
+        // 新 Loader 意味着接下来可以定义出新的脚本类。类解析缓存只按类名索引、不含 Loader，
+        // 不清掉会跨运行命中上一次同名的脚本类（详见 ClassResolver#clearClassCache）
+        ClassResolver.clearClassCache();
         // 未显式指定 ClassDefiner 时使用代理：每次 defineClass 时动态读取 defaultClassDefiner
         // 这样构造之后再 setDefaultClassDefiner() 也能生效
         this.classDefiner = new LazyDefaultDefiner(this.loader);
@@ -85,6 +98,7 @@ public final class DynamicClassGenerator {
 
     public DynamicClassGenerator(ClassLoader parentLoader, ClassDefiner classDefiner) {
         this.loader = new Loader(parentLoader);
+        ClassResolver.clearClassCache();
         // 显式指定的 classDefiner 直接使用（不经过代理）
         this.classDefiner = classDefiner != null ? classDefiner : this.loader;
     }
@@ -138,6 +152,37 @@ public final class DynamicClassGenerator {
 
     public Class<?> getGenerated(String className) {
         return cache.get(className);
+    }
+
+    /** 登记由 {@link CustomClassExecutor} 解释执行的方法体（生成期调用）。 */
+    private void registerMethodBody(String className, String methodName, String descriptor,
+                                    MethodDeclarationNode decl) {
+        methodBodies.put(methodKey(className, methodName, descriptor), decl);
+    }
+
+    /**
+     * 查找方法体，供 {@link CustomClassExecutor#execute} 使用。
+     *
+     * @param paramCount 参数个数，精确描述符匹配不上时用于回退查找
+     * @return 方法体 AST，未登记时返回 null
+     */
+    public MethodDeclarationNode findMethodBody(String className, String methodName,
+                                                String descriptor, int paramCount) {
+        MethodDeclarationNode exact = methodBodies.get(methodKey(className, methodName, descriptor));
+        if (exact != null) return exact;
+
+        // 回退：部分调用场景没有精确描述符，按"类名 + 方法名 + 参数个数"匹配
+        String prefix = className + "#" + methodName + "#";
+        for (Map.Entry<String, MethodDeclarationNode> e : methodBodies.entrySet()) {
+            if (!e.getKey().startsWith(prefix)) continue;
+            List<ParameterNode> params = e.getValue().getParameters();
+            if ((params != null ? params.size() : 0) == paramCount) return e.getValue();
+        }
+        return null;
+    }
+
+    private static String methodKey(String className, String methodName, String descriptor) {
+        return className + "#" + methodName + "#" + descriptor;
     }
 
     private Class<?> doGenerate(ClassDeclarationNode classDecl) {
@@ -210,8 +255,7 @@ public final class DynamicClassGenerator {
             if (delegateToExecutor) {
                 String desc = buildDescriptor(method);
                 addDelegateMethod(cw, method, name, classDecl.isInterface());
-                CustomClassExecutor.registerMethod(
-                        name, method.getMethodName(), desc, method);
+                registerMethodBody(name, method.getMethodName(), desc, method);
             } else {
                 addEmptyMethod(cw, method, classDecl.isInterface());
             }
@@ -253,16 +297,30 @@ public final class DynamicClassGenerator {
         ClassReferenceNode fieldType = eraseTypeParameter(field.getType(), typeParams);
         String descriptor = DescriptorUtils.fieldDescriptor(fieldType);
 
-        int mods = Opcodes.ACC_PUBLIC;
-        var modifiers = field.getModifiers();
-        if (modifiers != null && !modifiers.toModifierString().isEmpty()) {
-            mods = modifiers.toAccessFlags();
-        }
-        mods |= Opcodes.ACC_PUBLIC;
+        int mods = memberAccessFlags(field.getModifiers());
 
         // static final 字面量 → ConstantValue 属性
-        Object constVal = extractConstantValue(field);
+        Object constVal = extractConstantValue(field, fieldType);
         cw.visitField(mods, fieldName, descriptor, null, constVal).visitEnd();
+    }
+
+    /**
+     * 计算字段 / 方法 / 构造器的访问标志。
+     * <p>
+     * 脚本成员的访问控制一律按 public 处理，理由是引擎自身的成员解析完全依赖反射
+     * （{@code getMethods()} / {@code getField()}），宿主也要能直接访问脚本类成员 ——
+     * 真正的 private 会让类内 {@code this.f()} 都解析不到。
+     * </p>
+     * <p>
+     * 因此先清掉显式的 private/protected 位再置 public。绝不能只做
+     * {@code mods |= ACC_PUBLIC}：{@code private int x;} 会得到 {@code 0x0003}
+     * （private|public），JVM 直接抛 {@code ClassFormatError: Illegal modifiers}。
+     * </p>
+     */
+    private static int memberAccessFlags(ClassModifiers modifiers) {
+        int flags = modifiers != null ? modifiers.toAccessFlags() : 0;
+        flags &= ~(Opcodes.ACC_PRIVATE | Opcodes.ACC_PROTECTED);
+        return flags | Opcodes.ACC_PUBLIC;
     }
 
     /**
@@ -279,19 +337,52 @@ public final class DynamicClassGenerator {
         return typeRef;
     }
 
-    private static Object extractConstantValue(FieldDeclarationNode field) {
+    /**
+     * 提取可写入 ConstantValue 属性的常量。
+     * <p>
+     * 字面量自身的类型未必等于字段声明类型（{@code static final long L = 30;} 里的 {@code 30}
+     * 是 int）。JVMS §4.7.2 要求 {@code J} 字段必须配 CONSTANT_Long、{@code D} 必须配
+     * CONSTANT_Double，类型不一致会抛
+     * {@code ClassFormatError: Inconsistent constant value type}，所以这里先按字段类型转换。
+     * </p>
+     */
+    private static Object extractConstantValue(FieldDeclarationNode field, ClassReferenceNode fieldType) {
         var mods = field.getModifiers();
         if (mods == null || !mods.isStatic() || !mods.isFinal()) return null;
-        ASTNode init = field.getInitialValue();
-        if (init instanceof LiteralNode lit) {
-            Object val = lit.getValue();
-            if (val instanceof Integer || val instanceof Long
-                    || val instanceof Float || val instanceof Double
-                    || val instanceof String) {
-                return val;
-            }
+        if (!(field.getInitialValue() instanceof LiteralNode lit)) return null;
+        Object val = coerceToFieldType(lit.getValue(), fieldType);
+        // 只有 JVMS 允许出现在 ConstantValue 里的类型才写成常量属性；
+        // boolean / char 不在其中，交给 <clinit> 赋值
+        if (val instanceof Integer || val instanceof Long
+                || val instanceof Float || val instanceof Double
+                || val instanceof String) {
+            return val;
         }
         return null;
+    }
+
+    /**
+     * 把字面量的原始值转换成字段声明类型对应的值（如 {@code long a = 30;} 的 {@code 30} → {@code 30L}）。
+     * <p>
+     * 类型无法转换（非数值字面量、字段类型未解析等）时原样返回，由调用方按原值处理。
+     * </p>
+     */
+    private static Object coerceToFieldType(Object value, ClassReferenceNode fieldType) {
+        if (value == null || fieldType == null) return value;
+        Class<?> target = fieldType.getResolvedClass();
+        if (target == null || !target.isPrimitive() || target == boolean.class) return value;
+        if (!(value instanceof Number) && !(value instanceof Character)) return value;
+
+        long asLong = value instanceof Character c ? c.charValue() : ((Number) value).longValue();
+        double asDouble = value instanceof Character c ? c.charValue() : ((Number) value).doubleValue();
+        if (target == int.class) return (int) asLong;
+        if (target == byte.class) return (int) (byte) asLong;
+        if (target == short.class) return (int) (short) asLong;
+        if (target == char.class) return (int) (char) asLong;
+        if (target == long.class) return asLong;
+        if (target == float.class) return (float) asDouble;
+        if (target == double.class) return asDouble;
+        return value;
     }
 
     private static boolean hasStaticLiteralFields(List<FieldDeclarationNode> fields) {
@@ -467,12 +558,7 @@ public final class DynamicClassGenerator {
         desc.append(")V");
         String descriptor = desc.toString();
 
-        int mods = Opcodes.ACC_PUBLIC;
-        var mMods = ctor.getModifiers();
-        if (mMods != null && !mMods.toModifierString().isEmpty()) {
-            mods = mMods.toAccessFlags();
-        }
-        mods |= Opcodes.ACC_PUBLIC;
+        int mods = memberAccessFlags(ctor.getModifiers());
 
         String internalName = DescriptorUtils.toInternalName(className);
         MethodVisitor mv = cw.visitMethod(mods, INIT,  descriptor, null, null);
@@ -486,9 +572,7 @@ public final class DynamicClassGenerator {
 
         // register method body for executor
         if (delegateToExecutor && ctor.getBody() != null) {
-            CustomClassExecutor.registerMethod(
-                    className, INIT, descriptor,
-                    wrapConstructorAsMethod(ctor));
+            registerMethodBody(className, INIT, descriptor, wrapConstructorAsMethod(ctor));
             // ★ 构造器体由 CustomClassExecutor 解释执行（在此之前只注册不调用，
             //   导致构造器体内的字段赋值等逻辑从未运行）
             emitExecuteCall(mv, className, INIT, descriptor, false, ctor.getParameters());
@@ -520,7 +604,7 @@ public final class DynamicClassGenerator {
             ASTNode init = field.getInitialValue();
             if (init instanceof LiteralNode lit) {
                 mv.visitVarInsn(Opcodes.ALOAD, 0);
-                pushLiteral(mv, lit);
+                pushLiteral(mv, lit, field.getType());
                 mv.visitFieldInsn(Opcodes.PUTFIELD, internalName,
                         field.getFieldName(), DescriptorUtils.fieldDescriptor(field.getType()));
             }
@@ -537,7 +621,7 @@ public final class DynamicClassGenerator {
             if (mods == null || !mods.isStatic()) continue;
             ASTNode init = field.getInitialValue();
             if (init instanceof LiteralNode lit) {
-                pushLiteral(mv, lit);
+                pushLiteral(mv, lit, field.getType());
                 mv.visitFieldInsn(Opcodes.PUTSTATIC, internalName,
                         field.getFieldName(), DescriptorUtils.fieldDescriptor(field.getType()));
             }
@@ -547,31 +631,41 @@ public final class DynamicClassGenerator {
         mv.visitEnd();
     }
 
-    private static void pushLiteral(MethodVisitor mv, LiteralNode lit) {
-        Object val = lit.getValue();
-        Class<?> type = lit.getType();
+    /**
+     * 按**字段声明类型**压入字面量。
+     * <p>
+     * 不能用字面量自身的类型决定压栈指令：{@code long a = 30;} 里的 {@code 30} 是 int，
+     * 按 int 压栈再 PUTFIELD 到 {@code J} 字段会得到
+     * {@code VerifyError: Bad type on operand stack}。这里先按字段类型转换再压栈。
+     * </p>
+     */
+    private static void pushLiteral(MethodVisitor mv, LiteralNode lit, ClassReferenceNode fieldType) {
+        pushValue(mv, coerceToFieldType(lit.getValue(), fieldType));
+    }
+
+    private static void pushValue(MethodVisitor mv, Object val) {
         if (val == null) {
             mv.visitInsn(Opcodes.ACONST_NULL);
-        } else if (type == int.class || type == byte.class || type == short.class || type == char.class) {
-            pushInt(mv, ((Number) val).intValue());
-        } else if (type == long.class) {
-            long v = (Long) val;
-            if (v == 0L) mv.visitInsn(Opcodes.LCONST_0);
-            else if (v == 1L) mv.visitInsn(Opcodes.LCONST_1);
-            else mv.visitLdcInsn(v);
-        } else if (type == float.class) {
-            float v = (Float) val;
-            if (v == 0.0f) mv.visitInsn(Opcodes.FCONST_0);
-            else if (v == 1.0f) mv.visitInsn(Opcodes.FCONST_1);
-            else if (v == 2.0f) mv.visitInsn(Opcodes.FCONST_2);
-            else mv.visitLdcInsn(v);
-        } else if (type == double.class) {
-            double v = (Double) val;
-            if (v == 0.0d) mv.visitInsn(Opcodes.DCONST_0);
-            else if (v == 1.0d) mv.visitInsn(Opcodes.DCONST_1);
-            else mv.visitLdcInsn(v);
-        } else if (type == boolean.class) {
-            mv.visitInsn((Boolean) val ? Opcodes.ICONST_1 : Opcodes.ICONST_0);
+        } else if (val instanceof Boolean b) {
+            mv.visitInsn(b ? Opcodes.ICONST_1 : Opcodes.ICONST_0);
+        } else if (val instanceof Integer i) {
+            pushInt(mv, i);
+        } else if (val instanceof Long l) {
+            if (l == 0L) mv.visitInsn(Opcodes.LCONST_0);
+            else if (l == 1L) mv.visitInsn(Opcodes.LCONST_1);
+            else mv.visitLdcInsn(l);
+        } else if (val instanceof Float f) {
+            if (f == 0.0f) mv.visitInsn(Opcodes.FCONST_0);
+            else if (f == 1.0f) mv.visitInsn(Opcodes.FCONST_1);
+            else if (f == 2.0f) mv.visitInsn(Opcodes.FCONST_2);
+            else mv.visitLdcInsn(f);
+        } else if (val instanceof Double d) {
+            if (d == 0.0d) mv.visitInsn(Opcodes.DCONST_0);
+            else if (d == 1.0d) mv.visitInsn(Opcodes.DCONST_1);
+            else mv.visitLdcInsn(d);
+        } else if (val instanceof Character c) {
+            // 字段声明类型未解析时的兜底：char 按 int 压栈
+            pushInt(mv, c);
         } else {
             mv.visitLdcInsn(val);
         }
@@ -627,11 +721,7 @@ public final class DynamicClassGenerator {
         String descriptor = buildDescriptor(method);
         String returnDesc = descriptor.substring(descriptor.indexOf(')') + 1);
 
-        int mods = Opcodes.ACC_PUBLIC;
-        var mMods = method.getModifiers();
-        if (mMods != null && !mMods.toModifierString().isEmpty()) {
-            mods = mMods.toAccessFlags();
-        }
+        int mods = memberAccessFlags(method.getModifiers());
 
         if (isInterface) {
             mods |= Opcodes.ACC_ABSTRACT;
@@ -639,7 +729,13 @@ public final class DynamicClassGenerator {
             return;
         }
 
-        mods |= Opcodes.ACC_PUBLIC;
+        // 抽象方法没有方法体：写 visitCode() 会得到
+        // ClassFormatError: Code attribute in native or abstract methods
+        if (method.getModifiers() != null && method.getModifiers().isAbstract()) {
+            cw.visitMethod(mods, methodName, descriptor, null, null).visitEnd();
+            return;
+        }
+
         MethodVisitor mv = cw.visitMethod(mods, methodName, descriptor, null, null);
         mv.visitCode();
 
@@ -819,11 +915,7 @@ public final class DynamicClassGenerator {
         String descriptor = buildDescriptor(method);
         ClassReferenceNode returnTypeRef = method.getReturnType();
 
-        int mods = Opcodes.ACC_PUBLIC;
-        var mMods = method.getModifiers();
-        if (mMods != null && !mMods.toModifierString().isEmpty()) {
-            mods = mMods.toAccessFlags();
-        }
+        int mods = memberAccessFlags(method.getModifiers());
 
         if (isInterface) {
             mods |= Opcodes.ACC_ABSTRACT;
@@ -831,7 +923,11 @@ public final class DynamicClassGenerator {
             return;
         }
 
-        mods |= Opcodes.ACC_PUBLIC;
+        if (method.getModifiers() != null && method.getModifiers().isAbstract()) {
+            cw.visitMethod(mods, method.getMethodName(), descriptor, null, null).visitEnd();
+            return;
+        }
+
         MethodVisitor mv = cw.visitMethod(mods, method.getMethodName(), descriptor, null, null);
         mv.visitCode();
         emitDefaultReturn(mv, returnTypeRef);

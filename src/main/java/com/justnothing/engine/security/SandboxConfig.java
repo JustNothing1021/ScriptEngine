@@ -25,6 +25,28 @@ package com.justnothing.engine.security;
  * <p>此类的 API 与旧版 {@code com.justnothing.javainterpreter.security.SandboxConfig}
  * 完全兼容（相同的字段、Builder 方法、预置常量），可直接替换使用。
  *
+ * <h3>定位：策略声明，不是安全边界</h3>
+ * <p><b>本类不提供任何强制能力，它只是一份"允许什么"的声明。</b>
+ * <ul>
+ *   <li>15 个 boolean 标志在引擎内部<b>没有任何消费方</b>，只有 getter。它们是给宿主
+ *       （如 Android 侧的 {@code BlockGuardSandbox} / seccomp 装配逻辑）读的，
+ *       由宿主决定装哪一层强制机制。引擎自己不会执行它们。</li>
+ *   <li>{@link #getPermissionChecker()} 才是引擎唯一会执行的部分，由
+ *       {@link SecurityGate} 在每次反射操作前检查 —— 但它只覆盖"脚本里显式写出来的调用"：
+ *       类解析、方法调用、字段读写、{@code new}。</li>
+ * </ul>
+ *
+ * <p>引擎层拦不住的情况：
+ * <ul>
+ *   <li><b>已允许方法内部的行为</b>：调用链一旦进入宿主代码，引擎只看到入口那一次合法调用。
+ *       放行了 {@code java.io.File} 之后，{@code new File(path).delete()} 就再没有阻拦。</li>
+ *   <li><b>宿主自己实现的反射</b>：引擎本身就是靠反射做类解析的，无法在语言层区分
+ *       "引擎的反射"和"脚本的反射"。</li>
+ * </ul>
+ *
+ * <p>因此真正的边界必须在宿主 / OS 层：拦"动作本身"（syscall、文件、网络）而不是"调用方"。
+ * Android 侧的 BlockGuardPolicy 与 seccomp 就是这一层。
+ *
  * @see IPermissionChecker
  * @see BasicPermissionChecker
  * @see PermissionType

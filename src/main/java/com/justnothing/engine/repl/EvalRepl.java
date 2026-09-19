@@ -154,10 +154,14 @@ public class EvalRepl {
             // 设置执行器上下文
             CustomClassExecutor.setContext(evalContext, parseContext);
 
-            Evaluator evaluator = new Evaluator(evalContext, parseContext);
-            List<Value> results = evaluator.evaluateAll(nodes);
-
-            CustomClassExecutor.clearContext();
+            List<Value> results;
+            try {
+                Evaluator evaluator = new Evaluator(evalContext, parseContext);
+                results = evaluator.evaluateAll(nodes);
+            } finally {
+                // ThreadLocal 上下文：求值抛异常也要清理，否则 REPL 线程会一直持有它
+                CustomClassExecutor.clearContext();
+            }
 
             for (Value v : results) {
                 if (!(v instanceof Value.VoidValue)) {

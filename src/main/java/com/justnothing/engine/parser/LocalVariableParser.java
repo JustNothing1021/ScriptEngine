@@ -674,6 +674,10 @@ abstract class LocalVariableParser extends BaseParser {
         // 基本类型 widening: int→long, int→double, float→double 等
         if (isWideningConversion(valueType, targetType)) return;
 
+        // 常量窄化: byte b = 1; / short s = 4; / char c = 65;
+        // Java 只对"值能放进目标类型的 int 常量表达式"放开，运行时变量（int i = 1; byte b = i;）仍然禁止
+        if (isConstantNarrowing(valueNode, valueType, targetType)) return;
+
         // 自动装箱: int → Integer, long → Long 等
         if (valueType.isPrimitive() && !targetType.isPrimitive()) {
             Class<?> boxed = box(valueType);
@@ -735,6 +739,23 @@ abstract class LocalVariableParser extends BaseParser {
         if (from == long.class)   return to == float.class || to == double.class;
         if (from == float.class)  return to == double.class;
         return false;
+    }
+
+    /**
+     * 常量窄化赋值：目标为 byte / short / char，右侧是值在目标范围内的 int 常量表达式。
+     * <p>
+     * 对应 JLS §5.2 的 assignment conversion —— 只对常量放开（{@code byte b = 1;} 合法），
+     * 运行时变量仍然禁止（{@code int i = 1; byte b = i;} 非法）。常量折叠在解析期就把
+     * {@code 1 + 1} 这类表达式折成了字面量，所以这里按 LiteralNode 判断即可。
+     * </p>
+     */
+    private static boolean isConstantNarrowing(ASTNode valueNode, Class<?> valueType, Class<?> targetType) {
+        if (valueType != int.class) return false;
+        if (targetType != byte.class && targetType != short.class && targetType != char.class) return false;
+        if (!(valueNode instanceof LiteralNode lit) || !(lit.getValue() instanceof Integer value)) return false;
+        if (targetType == byte.class) return value >= Byte.MIN_VALUE && value <= Byte.MAX_VALUE;
+        if (targetType == short.class) return value >= Short.MIN_VALUE && value <= Short.MAX_VALUE;
+        return value >= Character.MIN_VALUE && value <= Character.MAX_VALUE;
     }
 
     /** 判断 GenericType 是否为 Java 原始类型（int/long/double/float/boolean/char/byte/short）。 */

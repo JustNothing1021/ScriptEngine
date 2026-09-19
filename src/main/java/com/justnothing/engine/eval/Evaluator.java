@@ -1775,6 +1775,7 @@ public class Evaluator implements ASTVisitor<Value> {
         if (v instanceof Value.LongValue) return long.class;
         if (v instanceof Value.DoubleValue) return double.class;
         if (v instanceof Value.BooleanValue) return boolean.class;
+        if (v instanceof Value.CharValue) return int.class;
         if (v instanceof Value.StringValue) return String.class;
         // 对于 ObjectValue（如从 Java 集合取出的元素），尝试获取更精确的类型
         Object obj = v.asJavaObject();

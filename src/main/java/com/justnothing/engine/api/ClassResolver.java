@@ -17,7 +17,20 @@ public class ClassResolver {
     private static final List<ClassLoader> registeredLoaders = new CopyOnWriteArrayList<>();
     private static ClassLoader primaryClassLoader = null;
     private static final Object loaderLock = new Object();
+    /**
+     * 全局类缓存（key = 类名，value = Class 或 {@link #NOT_FOUND}）。
+     * <p><b>注意：key 不含 ClassLoader。</b>引擎的脚本类由"每次运行新建的 Loader"定义，
+     * 同名类在不同 Loader 下是不同的 Class，所以这个按类名索引的缓存会跨运行串味：
+     * <ul>
+     *   <li>正命中过期：改了脚本里的类结构再跑一次，解析期仍绑到上一次那个 Class；</li>
+     *   <li>负命中过期：上一次找不到的类名（NOT_FOUND），这一次被定义了也永远找不到。</li>
+     * </ul>
+     * 因此每次出现新的"能定义脚本类的 Loader"都必须清空缓存（见
+     * {@code DynamicClassGenerator} 构造函数对 {@link #clearClassCache()} 的调用）。
+     */
     private static final Map<String, Object> classCache = new ConcurrentHashMap<>();
+    /** classCache 的容量上限，超过时整体清空，避免无界增长。 */
+    private static final int CLASS_CACHE_LIMIT = 4096;
     /**
      * 带 import 解析的独立缓存。
      * <p>直接查找（findClass）失败的黑名单不应阻断 import 解析：简单名（如 String）
@@ -36,6 +49,12 @@ public class ClassResolver {
     /** 哨兵对象，标记"已查找但不存在"的类（黑名单） */
     private static final Object NOT_FOUND = new Object();
 
+    /**
+     * 清空类解析缓存（含 {@code import} 分区缓存）。
+     * <p>缓存只按名字索引、不含 ClassLoader，所以<b>新建能定义脚本类的 Loader 时必须调用</b>：
+     * 否则同名的脚本类会跨运行命中上一次的 Class，而旧的 {@code NOT_FOUND} 黑名单会让
+     * 新定义的类永远解析不到。同一运行内不需要调用。
+     */
     public static void clearClassCache() {
         classCache.clear();
         importClassCache.clear();
@@ -139,21 +158,29 @@ public class ClassResolver {
 
         Class<?> clazz = findClassInternal(className, classLoader);
         if (clazz != null) {
-            classCache.put(className, clazz);
+            cacheClass(className, clazz);
             return clazz;
         }
 
         if (className.contains(".")) {
             clazz = tryNestedVariants(className, classLoader);
             if (clazz != null) {
-                classCache.put(className, clazz);
+                cacheClass(className, clazz);
                 return clazz;
             }
         }
 
         // 黑名单缓存
-        classCache.put(className, NOT_FOUND);
+        cacheClass(className, NOT_FOUND);
         return null;
+    }
+
+    /** 写入 classCache，超过容量上限时整体清空（与 importClassCache 同样的策略）。 */
+    private static void cacheClass(String className, Object value) {
+        if (classCache.size() >= CLASS_CACHE_LIMIT) {
+            classCache.clear();
+        }
+        classCache.put(className, value);
     }
 
     public static Class<?> findClassWithImports(String className, ClassLoader classLoader, List<String> imports) {

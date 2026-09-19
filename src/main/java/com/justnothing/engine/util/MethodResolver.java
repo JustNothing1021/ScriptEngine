@@ -918,16 +918,23 @@ public class MethodResolver {
 
     /**
      * 将实际参数强制转换为目标方法的参数类型（处理装箱/拆箱）。
+     * <p>
+     * 结果长度固定为 {@code paramTypes.length}（{@code Method.invoke} 的要求）：
+     * 实参多于形参时截断、少于形参时补 {@code null}。早期实现按 {@code args.length}
+     * 建数组并直接取 {@code paramTypes[i]}，实参更多时会抛
+     * {@code ArrayIndexOutOfBoundsException}。
+     * </p>
      *
      * @param paramTypes 目标方法的参数类型数组
      * @param args       实际参数值数组
      * @return 转换后的参数数组
      */
     public static Object[] coerceArgs(Class<?>[] paramTypes, Object[] args) {
-        if (args == null) return new Object[0];
-        Object[] result = new Object[args.length];
-        for (int i = 0; i < args.length; i++) {
-            result[i] = coerceArg(paramTypes[i], args[i]);
+        if (paramTypes == null) return args != null ? args : new Object[0];
+        Object[] actual = args != null ? args : new Object[0];
+        Object[] result = new Object[paramTypes.length];
+        for (int i = 0; i < paramTypes.length; i++) {
+            result[i] = coerceArg(paramTypes[i], i < actual.length ? actual[i] : null);
         }
         return result;
     }

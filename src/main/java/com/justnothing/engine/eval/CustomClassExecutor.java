@@ -9,11 +9,9 @@ import com.justnothing.engine.parser.ParseContext;
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 
 public class CustomClassExecutor {
 
-    private static final Map<String, MethodDeclarationNode> methodRegistry = new ConcurrentHashMap<>();
     private static final ThreadLocal<ExecutorContext> currentContext = new ThreadLocal<>();
 
     /** 正在执行的脚本类方法帧，用于嵌套调用返回后刷新外层的字段镜像。 */
@@ -47,35 +45,22 @@ public class CustomClassExecutor {
         return "$field$" + fieldName;
     }
 
-    public static void registerMethod(String className, String methodName, String descriptor,
-                                       MethodDeclarationNode decl) {
-        methodRegistry.put(key(className, methodName, descriptor), decl);
-    }
-
-    public static void unregisterClass(String className) {
-        methodRegistry.entrySet().removeIf(e -> e.getKey().startsWith(className + "#"));
-    }
-
-    private static String key(String className, String methodName, String descriptor) {
-        return className + "#" + methodName + "#" + descriptor;
-    }
-
     /**
      * 由生成的字节码调用。参数和返回类型固定为 Object 以兼容所有签名。
      */
     public static Object execute(String className, String methodName, String descriptor,
                                   Object instance, Object[] args) {
-        String k = key(className, methodName, descriptor);
-        MethodDeclarationNode method = methodRegistry.get(k);
-        if (method == null) {
-            // 用参数数量 fallback 查找（部分调用场景没有精确描述符）
-            method = findMethodByParamCount(className, methodName, args != null ? args.length : 0);
-        }
+        ExecutorContext ctx = requireContext();
+
+        // 方法体登记在生成它的 DynamicClassGenerator 上（见 registerMethodBody 的说明）
+        DynamicClassGenerator codegen = ctx.parseContext != null ? ctx.parseContext.getCodeGenerator() : null;
+        MethodDeclarationNode method = codegen != null
+                ? codegen.findMethodBody(className, methodName, descriptor, args != null ? args.length : 0)
+                : null;
         if (method == null) {
             throw new RuntimeException("Method not found: " + className + "#" + methodName);
         }
 
-        ExecutorContext ctx = requireContext();
         ASTNode body = method.getBody();
         if (body == null) {
             return defaultReturn(method.getReturnType());
@@ -157,18 +142,6 @@ public class CustomClassExecutor {
 
     /** 一个正在执行的脚本类方法帧：绑定实例、实例字段表与该帧的字段镜像上下文。 */
     private record ActiveFrame(Object instance, Map<String, Field> fields, EvalContext methodCtx) {
-    }
-
-    private static MethodDeclarationNode findMethodByParamCount(String className, String methodName, int paramCount) {
-        String prefix = className + "#" + methodName + "#";
-        for (Map.Entry<String, MethodDeclarationNode> e : methodRegistry.entrySet()) {
-            if (e.getKey().startsWith(prefix)) {
-                List<ParameterNode> params = e.getValue().getParameters();
-                int count = params != null ? params.size() : 0;
-                if (count == paramCount) return e.getValue();
-            }
-        }
-        return null;
     }
 
     /** 查找脚本引擎生成的类（用于静态方法中把 this 绑定为类对象）。 */

@@ -97,8 +97,9 @@ public final class ConstantFolder {
                         .value(result).type(TypeInferrer.infer(result))
                         .location(node.getLocation()).build();
             }
-        } catch (ArithmeticException | NumberFormatException ignored) {
-            // 除零、溢出等 — 不折叠，保留原表达式让运行时报错
+        } catch (RuntimeException ignored) {
+            // 折叠只是优化：除零、溢出、类型不可比等一律放弃折叠，
+            // 保留原表达式让运行期给出可读的类型错误，绝不能让内部异常冒到解析期
         }
 
         return node;

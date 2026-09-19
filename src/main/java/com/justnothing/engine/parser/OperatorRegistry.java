@@ -274,12 +274,15 @@ public final class OperatorRegistry {
                         (a, b) -> new Value.IntValue(a * b)));
         registerBuiltinBinary(Operators.DIVIDE, Number.class, Number.class, Object.class,
                 (l, r) -> smartNumericOp(l, r,
-                        (a, b) -> { if (b == 0) throw new EvalException("Division by zero", ErrorCode.EVAL_DIVISION_BY_ZERO); return new Value.DoubleValue(a / b); },
+                        // 浮点除法遵循 IEEE 754：除以 0 得到 Infinity / NaN，不抛异常（与 Java 一致）；
+                        // 整数除零仍然报错（Java 抛 ArithmeticException）
+                        (a, b) -> new Value.DoubleValue(a / b),
                         (a, b) -> { if (b == 0) throw new EvalException("Division by zero", ErrorCode.EVAL_DIVISION_BY_ZERO); return new Value.LongValue(a / b); },
                         (a, b) -> { if (b == 0) throw new EvalException("Division by zero", ErrorCode.EVAL_DIVISION_BY_ZERO); return new Value.IntValue(a / b); }));
         registerBuiltinBinary(Operators.MODULO, Number.class, Number.class, Object.class,
                 (l, r) -> smartNumericOp(l, r,
-                        (a, b) -> { if (b == 0) throw new EvalException("Division by zero", ErrorCode.EVAL_DIVISION_BY_ZERO); return new Value.DoubleValue(a % b); },
+                        // 浮点取模同理：x % 0.0 → NaN
+                        (a, b) -> new Value.DoubleValue(a % b),
                         (a, b) -> { if (b == 0) throw new EvalException("Division by zero", ErrorCode.EVAL_DIVISION_BY_ZERO); return new Value.LongValue(a % b); },
                         (a, b) -> { if (b == 0) throw new EvalException("Division by zero", ErrorCode.EVAL_DIVISION_BY_ZERO); return new Value.IntValue(a % b); }));
 
@@ -314,6 +317,14 @@ public final class OperatorRegistry {
                 OperatorRegistry::arrayCartesianProduct);
 
         // ===== 比较运算符 =====
+        // 数值相等必须走数值提升（1 == 1L、1 == 1.0 为真），所以单独注册 (Number, Number)：
+        // findBinaryCompatible 对数值运算符有 +0.5 加权，会优先于下面的 (Object, Object)。
+        // 落到 (Object, Object) 的是 Value.equals —— 那是按包装类型严格比较的
+        //（IntValue.equals(LongValue) 恒为 false），语义上不等价于 Java 的 ==。
+        registerBuiltinBinary(Operators.EQUAL, Number.class, Number.class, Boolean.class,
+                (l, r) -> new Value.BooleanValue(numericEquals(l, r)));
+        registerBuiltinBinary(Operators.NOT_EQUAL, Number.class, Number.class, Boolean.class,
+                (l, r) -> new Value.BooleanValue(!numericEquals(l, r)));
         registerBuiltinBinary(Operators.EQUAL, Object.class, Object.class, Boolean.class,
                 (l, r) -> new Value.BooleanValue(l.equals(r)));
         registerBuiltinBinary(Operators.NOT_EQUAL, Object.class, Object.class, Boolean.class,
@@ -335,20 +346,63 @@ public final class OperatorRegistry {
         registerBuiltinBinary(Operators.LOGICAL_OR, Object.class, Object.class, Boolean.class,
                 (l, r) -> new Value.BooleanValue(l.isTruthy() || r.isTruthy()));
 
-        // ===== 位运算符 (int, int) → int =====
-        // 注意：注册 int.class 而非 Integer.class，这样基本类型可以直接精确匹配
+        // ===== 位运算符 =====
+        // 注意：注册 int.class / long.class 而非包装类型，这样基本类型可以直接精确匹配。
+        // 按 Java 的二元数值提升：两个操作数先提升到 int（byte/short/char 也走 int），
+        // 只要有一个是 long 就整体按 long 运算 —— 所以每种组合都要注册，
+        // 只注册 (int,int) 会让 `long | long` 直接报 "No matching operator"。
         registerBuiltinBinary(Operators.BITWISE_AND, int.class, int.class, int.class,
                 (l, r) -> new Value.IntValue(l.asInt() & r.asInt()));
+        registerBuiltinBinary(Operators.BITWISE_AND, int.class, long.class, Long.class,
+                (l, r) -> new Value.LongValue(l.asInt() & r.asLong()));
+        registerBuiltinBinary(Operators.BITWISE_AND, long.class, int.class, Long.class,
+                (l, r) -> new Value.LongValue(l.asLong() & r.asInt()));
+        registerBuiltinBinary(Operators.BITWISE_AND, long.class, long.class, Long.class,
+                (l, r) -> new Value.LongValue(l.asLong() & r.asLong()));
         registerBuiltinBinary(Operators.BITWISE_OR, int.class, int.class, int.class,
                 (l, r) -> new Value.IntValue(l.asInt() | r.asInt()));
+        registerBuiltinBinary(Operators.BITWISE_OR, int.class, long.class, Long.class,
+                (l, r) -> new Value.LongValue(l.asInt() | r.asLong()));
+        registerBuiltinBinary(Operators.BITWISE_OR, long.class, int.class, Long.class,
+                (l, r) -> new Value.LongValue(l.asLong() | r.asInt()));
+        registerBuiltinBinary(Operators.BITWISE_OR, long.class, long.class, Long.class,
+                (l, r) -> new Value.LongValue(l.asLong() | r.asLong()));
         registerBuiltinBinary(Operators.BITWISE_XOR, int.class, int.class, int.class,
                 (l, r) -> new Value.IntValue(l.asInt() ^ r.asInt()));
+        registerBuiltinBinary(Operators.BITWISE_XOR, int.class, long.class, Long.class,
+                (l, r) -> new Value.LongValue(l.asInt() ^ r.asLong()));
+        registerBuiltinBinary(Operators.BITWISE_XOR, long.class, int.class, Long.class,
+                (l, r) -> new Value.LongValue(l.asLong() ^ r.asInt()));
+        registerBuiltinBinary(Operators.BITWISE_XOR, long.class, long.class, Long.class,
+                (l, r) -> new Value.LongValue(l.asLong() ^ r.asLong()));
+
+        // ===== 移位运算符 =====
+        // 结果类型取决于**左操作数**（Java 语义：左操作数是什么类型就按什么类型移位，
+        // 只有左操作数是 long 时才是 64 位移位）。
         registerBuiltinBinary(Operators.LEFT_SHIFT, int.class, int.class, int.class,
                 (l, r) -> new Value.IntValue(l.asInt() << r.asInt()));
+        registerBuiltinBinary(Operators.LEFT_SHIFT, int.class, long.class, Integer.class,
+                (l, r) -> new Value.IntValue(l.asInt() << (int) r.asLong()));
+        registerBuiltinBinary(Operators.LEFT_SHIFT, long.class, int.class, Long.class,
+                (l, r) -> new Value.LongValue(l.asLong() << r.asInt()));
+        registerBuiltinBinary(Operators.LEFT_SHIFT, long.class, long.class, Long.class,
+                (l, r) -> new Value.LongValue(l.asLong() << (int) r.asLong()));
         registerBuiltinBinary(Operators.RIGHT_SHIFT, int.class, int.class, int.class,
                 (l, r) -> new Value.IntValue(l.asInt() >> r.asInt()));
+        registerBuiltinBinary(Operators.RIGHT_SHIFT, int.class, long.class, Integer.class,
+                (l, r) -> new Value.IntValue(l.asInt() >> (int) r.asLong()));
+        registerBuiltinBinary(Operators.RIGHT_SHIFT, long.class, int.class, Long.class,
+                (l, r) -> new Value.LongValue(l.asLong() >> r.asInt()));
+        registerBuiltinBinary(Operators.RIGHT_SHIFT, long.class, long.class, Long.class,
+                (l, r) -> new Value.LongValue(l.asLong() >> (int) r.asLong()));
         registerBuiltinBinary(Operators.UNSIGNED_RIGHT_SHIFT, int.class, int.class, int.class,
                 (l, r) -> new Value.IntValue(l.asInt() >>> r.asInt()));
+        registerBuiltinBinary(Operators.UNSIGNED_RIGHT_SHIFT, int.class, long.class, Integer.class,
+                (l, r) -> new Value.IntValue(l.asInt() >>> (int) r.asLong()));
+        registerBuiltinBinary(Operators.UNSIGNED_RIGHT_SHIFT, long.class, int.class, Long.class,
+                (l, r) -> new Value.LongValue(l.asLong() >>> r.asInt()));
+        registerBuiltinBinary(Operators.UNSIGNED_RIGHT_SHIFT, long.class, long.class, Long.class,
+                (l, r) -> new Value.LongValue(l.asLong() >>> (int) r.asLong()));
 
         // ===== 范围运算符 =====
         registerBuiltinBinary(Operators.RANGE, int.class, int.class, Object.class,
@@ -368,6 +422,8 @@ public final class OperatorRegistry {
                 v -> new Value.BooleanValue(!v.isTruthy()));
         registerBuiltinUnary(Operators.BITWISE_NOT, int.class, int.class,
                 v -> new Value.IntValue(~v.asInt()));
+        registerBuiltinUnary(Operators.BITWISE_NOT, long.class, Long.class,
+                v -> new Value.LongValue(~v.asLong()));
     }
 
     // ==================== 智能运算辅助方法 ====================
@@ -410,6 +466,23 @@ public final class OperatorRegistry {
             return new Value.LongValue(l.asLong() + r.asLong());
         }
         return new Value.IntValue(l.asInt() + r.asInt());
+    }
+
+    /**
+     * 数值相等（按 Java 的二元数值提升）：{@code 1 == 1L}、{@code 1 == 1.0} 都为真。
+     * <p>
+     * 注意与 {@link Value#equals} 的区别：那是按包装类型严格比较的，
+     * {@code IntValue.equals(LongValue)} 恒为 false。
+     * </p>
+     */
+    private static boolean numericEquals(Value a, Value b) {
+        if (a instanceof Value.DoubleValue || b instanceof Value.DoubleValue) {
+            return a.asDouble() == b.asDouble();
+        }
+        if (a instanceof Value.LongValue || b instanceof Value.LongValue) {
+            return a.asLong() == b.asLong();
+        }
+        return a.asInt() == b.asInt();
     }
 
     private static int compareValues(Value a, Value b) {

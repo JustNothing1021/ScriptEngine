@@ -56,7 +56,7 @@ public class EvalContext implements AutoCloseable {
 
     public EvalContext createChild() {
         EvalContext child = new EvalContext(this, output);
-        child.securityGate = this.securityGate;
+        child.setSecurityGate(this.securityGate);
         return child;
     }
 
@@ -174,8 +174,15 @@ public class EvalContext implements AutoCloseable {
      * 设置安全门卫。设为 null 表示无限制模式（默认）。
      *
      * <p>子上下文通过 createChild() 继承父上下文的 securityGate。
+     *
+     * <p>同时同步给 {@link Builtins} —— {@code getField} / {@code setField} /
+     * {@code invokeMethod} / {@code analyze} / {@code cast} / {@code isInstanceOf}
+     * 这些内置函数会自己做反射，必须和解释器共用同一个 gate，否则就是绕过策略的后门。
      */
     public void setSecurityGate(SecurityGate securityGate) {
         this.securityGate = securityGate;
+        if (builtins != null) {
+            builtins.setSecurityGate(securityGate);
+        }
     }
 }

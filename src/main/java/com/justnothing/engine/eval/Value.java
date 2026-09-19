@@ -108,6 +108,8 @@ public abstract class Value {
         public char getValue() { return value; }
         public char asChar() { return value; }
         public int asInt() { return value; }
+        public long asLong() { return value; }
+        public double asDouble() { return value; }
         public String asString() { return Character.toString(value); }
         public boolean isTruthy() { return value != 0; }
         public Object asJavaObject() { return value; }

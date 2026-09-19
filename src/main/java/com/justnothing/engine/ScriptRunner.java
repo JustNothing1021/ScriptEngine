@@ -181,9 +181,15 @@ public class ScriptRunner {
             mark = timingLog ? System.nanoTime() : 0L;
 
             CustomClassExecutor.setContext(evalContext, parseContext);
-            Evaluator evaluator = new Evaluator(evalContext, parseContext);
-            List<Value> results = evaluator.evaluateAll(nodes);
-            CustomClassExecutor.clearContext();
+            List<Value> results;
+            try {
+                Evaluator evaluator = new Evaluator(evalContext, parseContext);
+                results = evaluator.evaluateAll(nodes);
+            } finally {
+                // setContext 用 ThreadLocal 存上下文，异常路径也必须清理：
+                // 否则求值失败的脚本会把 EvalContext/ParseContext 一直留在调用线程上
+                CustomClassExecutor.clearContext();
+            }
             long tEval = timingLog ? System.nanoTime() - mark : 0L;
 
             if (timingLog) {
@@ -277,9 +283,15 @@ public class ScriptRunner {
             }
 
             CustomClassExecutor.setContext(evalContext, parseContext);
-            Evaluator evaluator = new Evaluator(evalContext, parseContext);
-            List<Value> results = evaluator.evaluateAll(nodes);
-            CustomClassExecutor.clearContext();
+            List<Value> results;
+            try {
+                Evaluator evaluator = new Evaluator(evalContext, parseContext);
+                results = evaluator.evaluateAll(nodes);
+            } finally {
+                // setContext 用 ThreadLocal 存上下文，异常路径也必须清理：
+                // 否则求值失败的脚本会把 EvalContext/ParseContext 一直留在调用线程上
+                CustomClassExecutor.clearContext();
+            }
 
             if (results.isEmpty()) return null;
             Value last = results.get(results.size() - 1);

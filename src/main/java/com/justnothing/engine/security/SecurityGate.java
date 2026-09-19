@@ -15,6 +15,21 @@ import java.lang.reflect.Method;
  *   <li><b>统一异常</b>：所有拦截操作抛出 {@link SecurityException}</li>
  * </ul>
  *
+ * <h3>定位：策略层，不是安全边界</h3>
+ * <p>本类拦截的是<b>"脚本里显式写出来的操作"</b> —— 类解析、方法调用、字段读写、{@code new}，
+ * 共五个入口（{@code Evaluator} 与 {@code Builtins} 共用同一个 gate，内置函数的反射入口
+ * 不再是后门）。它<b>拦不住</b>：
+ * <ul>
+ *   <li><b>已允许方法内部的行为</b>：调用链进入宿主代码后，引擎只看到入口那一次调用。
+ *       放行了 {@code java.io.File} 就等于放行了它内部所有的文件操作。</li>
+ *   <li><b>宿主代码自身的转发</b>：脚本拿到一个已允许对象后，对象内部再调用别的对象，
+ *       中间不经过引擎，也就不过闸。</li>
+ * </ul>
+ *
+ * <p>换句话说：这里是<b>准入策略</b>，用来减少暴露面、给宿主一个可读的意图声明；
+ * 真正的强制边界要落在宿主 / OS 层（Android BlockGuardPolicy、seccomp 拦 syscall），
+ * 那一层拦的是"动作本身"，与调用方是谁无关。
+ *
  * <h3>使用方式</h3>
  * <pre>{@code
  * // 在 Evaluator 的反射调用前插入：
